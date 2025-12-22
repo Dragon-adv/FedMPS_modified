@@ -88,5 +88,13 @@ def args_parser():
     parser.add_argument('--ntd_tau', type=float, default=1, help='for fedntd, the temperature of distilling')
     parser.add_argument('--ntd_beta', type=float, default=1, help='for fedntd, the wight of ntdloss')
 
+    # for SFD statistics aggregation (RFF parameters)
+    parser.add_argument('--rf_seed', type=int, default=42, help='random seed for RFF model initialization')
+    parser.add_argument('--rf_dim_high', type=int, default=3000, help='RFF dimension for high-level features')
+    parser.add_argument('--rf_dim_low', type=int, default=3000, help='RFF dimension for low-level features')
+    parser.add_argument('--rbf_gamma_high', type=float, default=0.01, help='RBF gamma parameter for high-level RFF model')
+    parser.add_argument('--rbf_gamma_low', type=float, default=0.01, help='RBF gamma parameter for low-level RFF model')
+    parser.add_argument('--rf_type', type=str, default='orf', help='RFF type: orf or iid')
+
     args = parser.parse_args()
     return args

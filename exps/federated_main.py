@@ -9,7 +9,13 @@ from pathlib import Path
 from torch.utils.data import TensorDataset
 import datetime
 import logging
+import pickle
+import random
+import numpy as np
 
+# 将项目根目录添加到 sys.path
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 lib_dir = (Path(__file__).parent / ".." / "lib").resolve()
 if str(lib_dir) not in sys.path:
@@ -22,6 +28,7 @@ from lib.options import *
 from lib.update import *
 from lib.models.models import *
 from lib.utils import *
+from lib.sfd_utils import RFF, aggregate_global_statistics
 
 model_urls = {
     'resnet18': 'https://download.pytorch.org/models/resnet18-5c106cde.pth',
@@ -505,6 +512,95 @@ def FedMPS(args, train_dataset, test_dataset, user_groups, user_groups_lt, local
     best_acc_w = -float('inf')  # best results w protos
     best_std_w = -float('inf')
     best_round_w = 0
+    
+    # ========== Initialize RFF models for SFD Statistics Aggregation ==========
+    # This initialization only needs to be done once before the main loop
+    print('\n' + '='*60)
+    print('Initializing SFD Statistics Aggregation Components')
+    print('='*60)
+    logger.info('Initializing SFD Statistics Aggregation Components')
+    
+    # Step 1: Get feature dimensions by running a dummy forward pass
+    # Use the first client's model to determine feature dimensions
+    dummy_model = copy.deepcopy(local_model_list[0])
+    dummy_model.eval()
+    dummy_model = dummy_model.to(args.device)
+    
+    # Create a dummy input to get feature dimensions (adjust size based on dataset)
+    if args.dataset == 'mnist' or args.dataset == 'femnist' or args.dataset == 'fashion':
+        dummy_input = torch.randn(1, 1, 28, 28).to(args.device)
+    elif args.dataset == 'cifar10' or args.dataset == 'cifar100' or args.dataset == 'realwaste' or args.dataset == 'flowers' or args.dataset == 'defungi':
+        dummy_input = torch.randn(1, 3, 32, 32).to(args.device)
+    elif args.dataset == 'tinyimagenet':
+        dummy_input = torch.randn(1, 3, 64, 64).to(args.device)
+    elif args.dataset == 'imagenet':
+        dummy_input = torch.randn(1, 3, 224, 224).to(args.device)
+    else:
+        # Default to CIFAR-10 size
+        dummy_input = torch.randn(1, 3, 32, 32).to(args.device)
+    
+    with torch.no_grad():
+        dummy_output = dummy_model(dummy_input)
+        if isinstance(dummy_output, tuple) and len(dummy_output) >= 4:
+            high_feature_dim = dummy_output[2].shape[1]  # high-level feature dimension
+            low_feature_dim = dummy_output[3].shape[1]   # low-level feature dimension
+        else:
+            raise ValueError(f"模型输出格式不符合预期，无法获取特征维度")
+    
+    print(f'Detected feature dimensions: high={high_feature_dim}, low={low_feature_dim}')
+    logger.info(f'Detected feature dimensions: high={high_feature_dim}, low={low_feature_dim}')
+    
+    # Step 2: Initialize RFF models for high and low levels
+    # Set random seed for reproducibility
+    backup_rng_state = {
+        'python': random.getstate(),
+        'numpy': np.random.get_state(),
+        'torch': torch.get_rng_state()
+    }
+    
+    # Set deterministic seed for RFF initialization
+    random.seed(args.rf_seed)
+    np.random.seed(args.rf_seed)
+    torch.manual_seed(args.rf_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.rf_seed)
+    
+    # Initialize RFF models
+    rf_model_high = RFF(
+        d=high_feature_dim,
+        D=args.rf_dim_high,
+        gamma=args.rbf_gamma_high,
+        device=args.device,
+        rf_type=args.rf_type
+    )
+    
+    rf_model_low = RFF(
+        d=low_feature_dim,
+        D=args.rf_dim_low,
+        gamma=args.rbf_gamma_low,
+        device=args.device,
+        rf_type=args.rf_type
+    )
+    
+    rf_models = {
+        'high': rf_model_high,
+        'low': rf_model_low
+    }
+    
+    # Restore random state
+    random.setstate(backup_rng_state['python'])
+    np.random.set_state(backup_rng_state['numpy'])
+    torch.set_rng_state(backup_rng_state['torch'])
+    
+    print(f'Initialized RFF models: high (d={high_feature_dim}, D={args.rf_dim_high}, gamma={args.rbf_gamma_high}), '
+          f'low (d={low_feature_dim}, D={args.rf_dim_low}, gamma={args.rbf_gamma_low})')
+    logger.info(f'Initialized RFF models: high (d={high_feature_dim}, D={args.rf_dim_high}, gamma={args.rbf_gamma_high}), '
+                f'low (d={low_feature_dim}, D={args.rf_dim_low}, gamma={args.rbf_gamma_low})')
+    print('='*60 + '\n')
+    
+    # Initialize global_stats to store the last round's statistics
+    global_stats = None
+    
     for round in tqdm(range(args.rounds)):
         local_weights, local_losses, local_high_protos, local_low_protos = [], [], {}, {}
         print(f'\n | Global Training Round : {round + 1} |\n')
@@ -542,6 +638,33 @@ def FedMPS(args, train_dataset, test_dataset, user_groups, user_groups_lt, local
         # begin training and output global logits
         global_logits = train_global_proto_model(global_model, train_dataloader)
 
+        # ========== SFD Statistics Aggregation Stage ==========
+        # Collect local statistics from all clients
+        print(f'[Round {round+1}] Collecting local statistics from all clients...')
+        logger.info(f'[Round {round+1}] Collecting local statistics from all clients...')
+        
+        client_responses = []
+        for idx in idxs_users:
+            local_model = LocalUpdate(args=args, dataset=train_dataset, idxs=user_groups[idx])
+            local_stats = local_model.get_local_statistics(
+                model=copy.deepcopy(local_model_list[idx]),
+                rf_models=rf_models,
+                args=args
+            )
+            client_responses.append(local_stats)
+        
+        # Aggregate global statistics
+        print(f'[Round {round+1}] Aggregating global statistics...')
+        logger.info(f'[Round {round+1}] Aggregating global statistics...')
+        
+        global_stats = aggregate_global_statistics(
+            client_responses=client_responses,
+            class_num=args.num_classes
+        )
+        
+        print(f'[Round {round+1}] Global statistics aggregation completed')
+        logger.info(f'[Round {round+1}] Global statistics aggregation completed')
+
         # test
         acc_list_l, loss_list_l, acc_list_g, loss_list, loss_total_list = test_inference_new_het_lt(args,local_model_list,test_dataset,classes_list,user_groups_lt,global_high_protos)
 
@@ -571,6 +694,49 @@ def FedMPS(args, train_dataset, test_dataset, user_groups, user_groups_lt, local
     print('| BEST ROUND: {} | For all users , mean of test acc is {:.5f}, std of test acc is {:.5f}'.format(best_round_w, best_acc_w, best_std_w))
     logger.info('best w results:')
     logger.info('| BEST ROUND: {} | For all users , mean of test acc is {:.5f}, std of test acc is {:.5f}'.format(best_round_w, best_acc_w, best_std_w))
+    
+    # Save final SFD statistics (from the last round)
+    # Use the same logdir pattern as the main function
+    save_dir = os.path.join('../newresults', args.alg, str(datetime.datetime.now().strftime("%Y-%m-%d/%H.%M.%S"))+'_'+args.dataset+'_n'+str(args.ways)+'_sfd_stats')
+    mkdirs(save_dir)
+    
+    # Save final global statistics from the last round
+    if global_stats is not None:
+        stats_save_path = os.path.join(save_dir, 'global_stats_final.pkl')
+        with open(stats_save_path, 'wb') as f:
+            pickle.dump(global_stats, f)
+        print(f'Saved final global statistics to {stats_save_path}')
+        logger.info(f'Saved final global statistics to {stats_save_path}')
+    
+    # Save RFF models state dict
+    rf_models_save_path = os.path.join(save_dir, 'rf_models.pkl')
+    rf_models_state = {
+        'high': rf_model_high.state_dict(),
+        'low': rf_model_low.state_dict()
+    }
+    with open(rf_models_save_path, 'wb') as f:
+        pickle.dump(rf_models_state, f)
+    print(f'Saved RFF models to {rf_models_save_path}')
+    logger.info(f'Saved RFF models to {rf_models_save_path}')
+    
+    # Save metadata
+    metadata = {
+        'high_feature_dim': high_feature_dim,
+        'low_feature_dim': low_feature_dim,
+        'rf_dim_high': args.rf_dim_high,
+        'rf_dim_low': args.rf_dim_low,
+        'rbf_gamma_high': args.rbf_gamma_high,
+        'rbf_gamma_low': args.rbf_gamma_low,
+        'rf_type': args.rf_type,
+        'rf_seed': args.rf_seed,
+        'num_classes': args.num_classes,
+        'num_clients': len(idxs_users)
+    }
+    metadata_save_path = os.path.join(save_dir, 'metadata.pkl')
+    with open(metadata_save_path, 'wb') as f:
+        pickle.dump(metadata, f)
+    print(f'Saved metadata to {metadata_save_path}')
+    logger.info(f'Saved metadata to {metadata_save_path}')
 
 
 

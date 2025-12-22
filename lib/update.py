@@ -24,11 +24,20 @@ class DatasetSplit(Dataset):
 
 
 class LocalUpdate(object):
+    """
+        本地训练执行器类，负责在联邦学习中管理单个客户端的训练过程。
+
+        主要职责包括：
+        1. 本地数据管理：根据分配的索引构建本地 DataLoader。
+        2. 算法逻辑封装：实现了包括 FedAvg, FedProx, MOON, FedProto 以及 FedMPS 在内的多种联邦学习更新机制。
+        3. 梯度计算与优化：管理本地模型在指定设备（GPU/CPU）上的反向传播、权重更新及指标计算。
+        4. 结果反馈：向服务器返回更新后的模型状态字典（state_dict）及相关的算法元数据（如原型 Prototypes）。
+    """
     def __init__(self, args, dataset, idxs):
         self.args = args
         self.trainloader = self.train_val_test(dataset, list(idxs))
         self.device = args.device
-        self.criterion = nn.NLLLoss().to(self.device)
+        self.criterion = nn.NLLLoss().to(self.device)   # Negative Log Likelihood Loss; nn.CrossEntropyLoss = nn.LogSoftmax + nn.NLLLoss
         self.ntd_criterion = NTD_Loss(args.num_classes, args.ntd_tau, args.ntd_beta)
         self.gkd_criterion = nn.CrossEntropyLoss(reduction="mean")
 
@@ -473,6 +482,36 @@ class LocalUpdate(object):
         return model.state_dict(), agg_protos_label
 
     def update_weights_fedmps(self, args, idx, global_high_protos, global_low_protos, global_logits, model, global_round=round):
+        """ """
+        """
+                执行 FedMPS 算法的本地更新过程。
+
+                该函数通过结合多级原型对比学习（Multi-Level Prototype-Based Contrastive Learning）和
+                软标签生成（Soft Label Generation）来应对联邦学习中的数据异构性。
+
+                参数:
+                    args: 全局参数配置对象，包含 alph, beta, gama 等损失权重系数。
+                    idx: 当前客户端的索引 ID。
+                    global_high_protos: 从服务器获取的全局高级特征原型。
+                    global_low_protos: 从服务器获取的全局低级特征原型。
+                    global_logits: 由全局模型生成的类别软标签预测，用于知识蒸馏。
+                    model: 需要训练的本地模型。
+                    global_round: 当前的全局通信轮次。
+
+                损失函数组成:
+                    loss1 (分类损失): 本地预测与真实标签之间的负对数似然损失（NLLLoss）。
+                    loss2 (高层对比损失): 本地高层特征与全局高层原型之间的对比学习损失，用于对齐高级语义。
+                    loss3 (底层对比损失): 本地底层特征与全局底层原型之间的对比学习损失，用于对齐基础表征。
+                    loss4 (蒸馏损失): 本地预测概率与全局模型预测（软标签）之间的 KL 散度，用于引入全局知识。
+
+                返回:
+                    model.state_dict(): 训练后的模型权重参数。
+                    epoch_loss: 包含各类损失分量的字典（total, 1, 2, 3, 4）。
+                    acc_val.item(): 最后一个 batch 的准确率。
+                    agg_high_protos_label: 收集到的本地高层原型字典，按标签分类。
+                    agg_low_protos_label: 收集到的本地底层原型字典，按标签分类。
+                    acc_last_epoch: 整个训练 epoch 的平均准确率。
+        """
         # Set mode to train model
         model.train()
         epoch_loss = {'total': [], '1': [], '2': [], '3': [],'4':[]}
@@ -633,6 +672,169 @@ class LocalUpdate(object):
 
         accuracy = correct/total
         return accuracy, loss
+
+    def get_local_statistics(self, model, rf_models, args):
+        """
+        计算本地统计量，用于 SFD 算法的统计量聚合阶段。
+
+        该方法参考了 SFD/src/flexp/sfd/stat_agg.py 中的 compute_local_stats 函数。
+        通过冻结的模型提取 high-level 和 low-level 特征，并使用对应的 RFF 模型计算随机特征，
+        然后分别计算每个类别的均值、外积和随机特征均值等统计量。
+
+        参数:
+            model: 完整的本地模型（如 FedMPS 模型），其 forward 返回包含 
+                   (logits, log_probs, high_features, low_features) 的元组
+            rf_models: 字典，包含不同层级对应的 RFF 模型实例，例如 
+                       {'high': rff_high, 'low': rff_low}
+            args: 全局参数对象，包含 num_classes 等信息
+
+        返回:
+            dict: 包含以下结构的字典
+                - 'high': 包含 high-level 统计量的字典
+                    - 'class_means': 每个类别的特征均值列表
+                    - 'class_outers': 每个类别的特征外积均值列表
+                    - 'class_rf_means': 每个类别的随机特征均值列表
+                - 'low': 包含 low-level 统计量的字典（结构同上）
+                - 'sample_per_class': 每个类别的样本数（两个层级共享）
+        """
+        # 准备工作：将 model 和 rf_models 设置为 eval 模式并移动到设备
+        model.eval()
+        model = model.to(self.device)
+        
+        # 将各个层级的 RFF 模型设置为 eval 模式并移动到设备
+        for level in rf_models:
+            rf_models[level].eval()
+            rf_models[level] = rf_models[level].to(self.device)
+
+        # 初始化列表来存储不同层级的特征、标签和随机特征
+        zs_high = []  # high-level 特征列表
+        zs_low = []   # low-level 特征列表
+        ys = []       # 标签列表
+        rfs_high = [] # high-level 随机特征列表
+        rfs_low = []  # low-level 随机特征列表
+
+        # 特征提取循环
+        with torch.no_grad():  # 重要：避免计算梯度
+            for batch_idx, (images, labels) in enumerate(self.trainloader):
+                images = images.to(self.device)
+                labels = labels.to(self.device)
+
+                # 调用模型获取输出
+                # 根据 FedMPS 模型结构：return logits, log_probs, high_protos, low_protos
+                output = model(images)
+                
+                # 提取 high-level 和 low-level 特征
+                # 索引 2 对应 high_protos，索引 3 对应 low_protos
+                if isinstance(output, tuple) and len(output) >= 4:
+                    high_features = output[2]  # high-level features
+                    low_features = output[3]   # low-level features
+                else:
+                    raise ValueError(f"模型输出格式不符合预期，期望包含至少4个元素的元组，实际得到: {type(output)}")
+
+                # 使用对应的 RFF 模型计算随机特征
+                rf_high = rf_models['high'](high_features)
+                rf_low = rf_models['low'](low_features)
+
+                # 将特征、标签和随机特征存入列表（转移到 CPU 以节省显存）
+                zs_high.append(high_features.cpu())
+                zs_low.append(low_features.cpu())
+                # 确保标签是一维的
+                labels_1d = labels.squeeze() if labels.dim() > 1 else labels
+                ys.append(labels_1d.cpu())
+                rfs_high.append(rf_high.cpu())
+                rfs_low.append(rf_low.cpu())
+
+        # 将列表拼接成大张量
+        z_high = torch.cat(zs_high, dim=0)  # shape: (total_samples, high_feature_dim)
+        z_low = torch.cat(zs_low, dim=0)    # shape: (total_samples, low_feature_dim)
+        y = torch.cat(ys, dim=0)            # shape: (total_samples,)
+        rf_high = torch.cat(rfs_high, dim=0)  # shape: (total_samples, high_rf_dim)
+        rf_low = torch.cat(rfs_low, dim=0)    # shape: (total_samples, low_rf_dim)
+
+        # 计算每个类别的样本数（两个层级共享）
+        num_classes = args.num_classes
+        sample_per_class = y.bincount(minlength=num_classes)
+
+        # 定义辅助函数：计算单个层级的统计量
+        def compute_level_stats(z, rf, level_name):
+            """
+            计算单个层级的统计量
+            
+            参数:
+                z: 特征张量，shape (total_samples, feature_dim)
+                rf: 随机特征张量，shape (total_samples, rf_dim)
+                level_name: 层级名称（用于错误提示）
+            
+            返回:
+                dict: 包含 class_means, class_outers, class_rf_means 的字典
+            """
+            class_means = []
+            class_outers = []
+            class_rf_means = []
+            
+            # 获取特征维度（从实际特征中获取，不假设）
+            feature_dim = z.shape[1]
+            rf_dim = rf.shape[1]
+            
+            # 遍历所有类别
+            for c in range(num_classes):
+                n_c = sample_per_class[c].item()
+                
+                if n_c == 0:
+                    # 如果该类别样本数为 0，则对应的均值和外积设为 0 张量
+                    class_mean = torch.zeros(feature_dim)
+                    class_outer = torch.zeros(feature_dim, feature_dim)
+                    class_rf_mean = torch.zeros(rf_dim)
+                else:
+                    # 筛选出属于类别 c 的特征和随机特征
+                    class_indices = (y == c)
+                    z_c = z[class_indices]  # shape: (n_c, feature_dim)
+                    rf_c = rf[class_indices]  # shape: (n_c, rf_dim)
+                    
+                    # 类均值 (mean)
+                    mu_c = z_c.mean(dim=0)  # shape: (feature_dim,)
+                    
+                    # 类外积 (outer product): 将特征转为 float64 精度计算
+                    z_c_f64 = z_c.to(torch.float64)
+                    # outer = (z_c.T @ z_c) / n_c
+                    outer = torch.matmul(z_c_f64.t(), z_c_f64) / n_c  # shape: (feature_dim, feature_dim)
+                    # 转回原始精度
+                    outer = outer.to(z_c.dtype)
+                    
+                    # 类 RFF 均值
+                    rf_mean_c = rf_c.mean(dim=0)  # shape: (rf_dim,)
+                    
+                    class_mean = mu_c
+                    class_outer = outer
+                    class_rf_mean = rf_mean_c
+                
+                # 将统计量存入列表
+                class_means.append(class_mean)
+                class_outers.append(class_outer)
+                class_rf_means.append(class_rf_mean)
+            
+            return {
+                'class_means': class_means,
+                'class_outers': class_outers,
+                'class_rf_means': class_rf_means
+            }
+        
+        # 分别计算 high-level 和 low-level 的统计量
+        high_stats = compute_level_stats(z_high, rf_high, 'high')
+        low_stats = compute_level_stats(z_low, rf_low, 'low')
+        
+        # 将 model 和 rf_models 移回 CPU 以释放显存
+        model.cpu()
+        for level in rf_models:
+            rf_models[level].cpu()
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        
+        # 返回按层级组织的统计量字典
+        return {
+            'high': high_stats,
+            'low': low_stats,
+            'sample_per_class': sample_per_class
+        }
 
 
 def test_inference(args, model, test_dataset,user_groups_gt,idx):

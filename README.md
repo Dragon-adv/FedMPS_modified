@@ -1,6 +1,11 @@
+FedMPS: https://github.com/wenxinyang1026/FedMPS
+
+SFD: https://github.com/zhb2000/SFD
+
+
 # FedMPS: Federated Learning in a Synergy of Multi-Level Prototype-Based Contrastive Learning and Soft Label Generation
 
-This is an official PyTorch implementation of the paper [**FedMPS: Federated Learning in a Synergy of Multi-Level Prototype-Based Contrastive Learning and Soft Label Generation (TNNLS 2025)**](https://ieeexplore.ieee.org/document/11186177). 
+[**FedMPS: Federated Learning in a Synergy of Multi-Level Prototype-Based Contrastive Learning and Soft Label Generation (TNNLS 2025)**](https://ieeexplore.ieee.org/document/11186177). 
 Our implementation is built upon the codebase of [FedProto](https://github.com/yuetan031/FedProto). We sincerely thank the authors for making their code publicly available.
 
 ## Requirments
