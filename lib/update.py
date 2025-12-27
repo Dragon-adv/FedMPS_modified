@@ -56,8 +56,8 @@ class LocalUpdate(object):
             real_sample_per_class = torch.zeros(args.num_classes, dtype=torch.long)
         
         # 计算平滑后的类别分布 π（用于 L_ACE 和 L_A-SCL）
-        beta_pi = getattr(args, 'beta_pi', 1.0)
-        self.pi_sample_per_class = make_pi_sample_per_class(real_sample_per_class, beta_pi)
+        beta_pi = getattr(args, 'beta_pi', 0.5)
+        self.pi_sample_per_class = self.make_pi_sample_per_class(real_sample_per_class, beta_pi)
         # 移动到设备
         self.pi_sample_per_class = self.pi_sample_per_class.to(self.device)
 
@@ -620,7 +620,7 @@ class LocalUpdate(object):
         # ABBL: 计算动态 scl_weight（余弦退火）
         if total_rounds is None:
             total_rounds = getattr(args, 'rounds', 100)
-        scl_weight_start = getattr(args, 'scl_weight_start', 0.1)
+        scl_weight_start = getattr(args, 'scl_weight_start', 1.0)
         scl_weight_end = getattr(args, 'scl_weight_end', 0.0)
         # 余弦退火公式: 0.5 * (start - end) * (1 + cos(pi * current / total)) + end
         if total_rounds > 0:
@@ -644,20 +644,19 @@ class LocalUpdate(object):
                 # Loss 1 (ABBL): L_ACE - 自适应交叉熵损失
                 # 关键：传入原始 logits，而非 log_probs
                 a_ce_gamma = getattr(args, 'a_ce_gamma', 0.1)
-                loss_ace = logit_adjustment_ce(
-                    logit=logits,  # 原始 logits
+                loss_ace = self.logit_adjustment_ce(
+                    logits=logits,  # 原始 logits
                     target=labels,
                     sample_per_class=self.pi_sample_per_class,
                     gamma=a_ce_gamma
                 )
 
-                # Loss 2 (ABBL): L_A-SCL - 自适应监督对比学习损失
-                scl_temperature = getattr(args, 'scl_temperature', 0.07)
-                loss_scl = a_scl_loss(
-                    z=projected_features,
-                    y=labels,
-                    temperature=scl_temperature,
-                    sample_per_class=self.pi_sample_per_class
+                # Loss 2 (ABBL): L_A-SCL - 自适应监督对比学习损失（使用修正后的方法）
+                loss_scl = self.compute_adaptive_supervised_contrastive_loss(
+                    projected_features=projected_features,
+                    labels=labels,
+                    n_k=self.pi_sample_per_class,
+                    args=args
                 )
 
                 # Loss 3 (FedMPS): high-level contrastive learning loss between local features and global prototypes
@@ -685,13 +684,14 @@ class LocalUpdate(object):
                 if len(global_logits) == 0:
                     loss_soft = 0 * loss_ace
                 else:
-                    global_probs = []
+                    # 从全局 logits 字典中获取对应类别的 logits
+                    global_logits_tensor = []
                     for l in labels:
-                        class_prob = global_logits[l.item()]
-                        global_probs.append(class_prob)
-                    global_probs = torch.stack(global_probs)
+                        class_logits = global_logits[l.item()]  # 获取该类别的全局 logits
+                        global_logits_tensor.append(class_logits)
+                    global_logits_tensor = torch.stack(global_logits_tensor)
                     # 使用 logits 计算 softmax（而非 probs）
-                    loss_soft = soft_loss(F.log_softmax(logits / T, dim=1), F.softmax(global_probs / T, dim=1))
+                    loss_soft = soft_loss(F.log_softmax(logits / T, dim=1), F.softmax(global_logits_tensor / T, dim=1))
 
                 # ABBL 集成版本的总损失公式
                 loss = loss_ace + scl_weight * loss_scl + args.alph * loss_proto_high + args.beta * loss_proto_low + args.gama * loss_soft
@@ -800,6 +800,141 @@ class LocalUpdate(object):
 
         accuracy = correct/total
         return accuracy, loss
+
+    @staticmethod
+    def make_pi_sample_per_class(real_sample_per_class, beta_pi):
+        """
+        计算平滑后的类别分布 π，用于解决 Non-IID 本地类缺失问题。
+        
+        参数:
+            real_sample_per_class: torch.Tensor, shape (num_classes,)
+                每个类别的真实样本数量。对于缺失的类别，该值为 0。
+            beta_pi: float
+                平滑系数，用于设置缺失类别的虚拟样本数。通常取值为 0.1 到 1.0 之间。
+        
+        返回:
+            pi_sample_per_class: torch.Tensor, shape (num_classes,)
+                平滑处理后的类别分布，所有类别（包括缺失类别）都有非零的样本数。
+        """
+        class_size_min = real_sample_per_class[real_sample_per_class > 0].min()
+        pi_sample_per_class = real_sample_per_class.clone()
+        pi_sample_per_class[pi_sample_per_class == 0] = class_size_min * beta_pi
+        return pi_sample_per_class
+
+    @staticmethod
+    def logit_adjustment_ce(logits, target, sample_per_class, gamma):
+        """
+        实现 L_ACE (Adaptive Cross-Entropy) 损失函数。
+        
+        **重要提示**：此函数的第一个参数 `logits` 必须是**原始 Logits**（未经过 Softmax/LogSoftmax），
+        函数内部会执行 `logits + gamma * log(pi)` 然后再做 CrossEntropy。
+        
+        参数:
+            logits: torch.Tensor, shape (batch_size, num_classes)
+                **原始 logits**（未经过 Softmax/LogSoftmax），直接从分类器输出获得。
+            target: torch.Tensor, shape (batch_size,)
+                真实标签，每个元素是类别索引。
+            sample_per_class: torch.Tensor, shape (num_classes,)
+                每个类别的样本数（通常使用 make_pi_sample_per_class 处理后的平滑分布 π）。
+            gamma: float
+                调整系数，控制类别不平衡调整的强度。通常取值为 0.1 到 1.0 之间。
+        
+        返回:
+            loss: torch.Tensor
+                计算得到的 L_ACE 损失值。
+        """
+        import torch
+        import torch.nn.functional as F
+        # 将 sample_per_class 扩展为与 logits 相同的形状，以便进行广播运算
+        sample_per_class = (sample_per_class
+            .type_as(logits)
+            .unsqueeze(dim=0)
+            .expand(logits.shape[0], -1))
+        
+        # 对 logits 进行自适应调整：logits + gamma * log(π)
+        adjusted_logits = logits + gamma * torch.log(sample_per_class + 1e-12)
+        
+        # 计算交叉熵损失
+        loss = F.cross_entropy(adjusted_logits, target, reduction='mean')
+        return loss
+
+    def compute_adaptive_supervised_contrastive_loss(self, projected_features, labels, n_k, args):
+        """
+        实现修正后的 L_A-SCL (Adaptive Supervised Contrastive Loss) 损失函数。
+        
+        该损失函数是监督对比学习（Supervised Contrastive Learning）的自适应版本。
+        通过基于类别频率调整负样本对的相似度矩阵，增强对尾部类别的特征学习。
+        
+        **关键修正**：
+        1. 维度修正：delta_negative 形状为 (1, B)，用于调整负样本（列）的相似度
+        2. 符号修正：使用加法 (+) 增加头部类负样本的相似度，迫使 Loss 变大
+        
+        参数:
+            projected_features: torch.Tensor, shape (batch_size, feature_dim)
+                投影后的特征向量（已归一化），通常来自 projector 的输出。
+            labels: torch.Tensor, shape (batch_size,)
+                样本对应的标签，每个元素是类别索引。
+            n_k: torch.Tensor, shape (num_classes,)
+                每个类别的样本数或频率比值（通常使用 make_pi_sample_per_class 处理后的平滑分布 π）。
+            args: 参数对象
+                包含 scl_temperature 等超参数。
+        
+        返回:
+            loss: torch.Tensor
+                计算得到的 L_A-SCL 损失值（标量）。
+        """
+        import torch
+        import torch.nn.functional as F
+        
+        # 获取温度参数
+        temperature = getattr(args, 'scl_temperature', 0.07)
+        
+        # 1. 确保特征已归一化
+        z = F.normalize(projected_features, p=2, dim=1)  # shape: (batch_size, feature_dim)
+        
+        # 2. 计算相似度矩阵 (z_i · z_j / temperature)
+        similarity_matrix = (z @ z.T) / temperature  # shape: (batch_size, batch_size)
+        
+        # 3. 获取正样本对掩码矩阵（相同标签的位置为 1）
+        labels_equal = labels.unsqueeze(0) == labels.unsqueeze(1)  # shape: (batch_size, batch_size)
+        positive_mask = labels_equal.float()  # 正样本掩码
+        
+        # 4. 计算 Delta (基于类别频率)
+        # delta_k 是每个类别的频率比值或 log 计数
+        # 这里使用 log(n_k) 作为调整项
+        delta_k = torch.log(n_k.float() + 1e-12)  # shape: (num_classes,)
+        
+        # 【关键修正 1：维度】
+        # 我们要调整的是"负样本"(列) 的相似度。
+        # labels 形状 (B,) -> delta_negative 形状应为 (1, B)
+        delta_negative = delta_k[labels].unsqueeze(0)  # shape: (1, batch_size)
+        
+        # 5. 生成负样本掩码（不同标签的位置为 1）
+        negative_mask = 1 - labels_equal.float()  # shape: (batch_size, batch_size)
+        
+        # 【关键修正 2：符号】
+        # 我们要增加头部类负样本的相似度（增加区分难度），迫使 Loss 变大。
+        # 使用加法 (+)
+        adjusted_similarity = similarity_matrix + negative_mask * delta_negative * 1.0
+        
+        # 6. 数值稳定性处理：减去最大值以防止数值溢出
+        logits_max = torch.max(adjusted_similarity, dim=1, keepdim=True).values
+        logits = adjusted_similarity - logits_max.detach()
+        
+        # 7. 排除自比较（对角线元素），计算 softmax 分母
+        eye_mask = 1 - torch.eye(z.shape[0], device=z.device)  # 排除对角线
+        exp_logits = torch.exp(logits) * eye_mask
+        log_prob = logits - torch.log(exp_logits.sum(dim=1, keepdim=True) + 1e-12)
+        
+        # 8. 计算每个样本的正样本对平均对数概率
+        mask_sum = positive_mask.sum(dim=1)  # 每个样本的正样本数量
+        # 处理没有正样本的情况（避免除零）
+        mask_sum = torch.clamp(mask_sum, min=1.0)
+        mean_log_prob_pos = (positive_mask * log_prob).sum(dim=1) / mask_sum
+        
+        # 9. 返回最终的监督对比学习损失（取负号并求平均）
+        loss = -mean_log_prob_pos.mean()
+        return loss
 
     def get_local_statistics(self, model, rf_models, args, stats_level='high'):
         """

@@ -100,16 +100,17 @@ def args_parser():
                         help='Statistics computation level: high (only high-level), low (only low-level), or both (default: high)')
 
     # for SFD SAFS (Synthetic Feature-based Decoupled training)
-    parser.add_argument('--enable_safs', type=int, default=0, 
-                        help='Enable SAFS feature synthesis (0: disabled, 1: enabled)')
+    # Note: For globally balanced datasets (e.g., CIFAR-10), synthetic feature numbers should be consistent
+    parser.add_argument('--enable_safs', type=int, default=1, 
+                        help='Enable SAFS feature synthesis (0: disabled, 1: enabled, default: 1)')
     parser.add_argument('--safs_steps', type=int, default=1000, 
                         help='Number of optimization steps for SAFS feature synthesis')
     parser.add_argument('--safs_lr', type=float, default=0.1, 
                         help='Learning rate for SAFS feature synthesis')
-    parser.add_argument('--safs_max_syn_num', type=int, default=2000, 
-                        help='Maximum synthetic features for the smallest class (default: 2000)')
+    parser.add_argument('--safs_max_syn_num', type=int, default=600, 
+                        help='Maximum synthetic features for the smallest class (default: 600, adjusted for globally balanced datasets)')
     parser.add_argument('--safs_min_syn_num', type=int, default=600, 
-                        help='Minimum synthetic features for the largest class (default: 600)')
+                        help='Minimum synthetic features for the largest class (default: 600, same as max for balanced datasets)')
     parser.add_argument('--safs_target_cov_eps', type=float, default=1e-5, 
                         help='Jitter for target covariance matrix in MeanCov Aligner (default: 1e-5)')
     parser.add_argument('--safs_input_cov_eps', type=float, default=1e-5, 
@@ -120,12 +121,13 @@ def args_parser():
                         help='Batch size for SAFS global model fine-tuning (default: 32)')
 
     # for ABBL (Adaptive Bi-Branch Learning) - SFD loss functions
-    parser.add_argument('--beta_pi', type=float, default=1.0,
-                        help='SFD parameter: coefficient for computing smoothed class distribution π in L_ACE (default: 1.0)')
+    # Note: These parameters are designed for Non-IID scenarios with potential class imbalance
+    parser.add_argument('--beta_pi', type=float, default=0.5,
+                        help='SFD parameter: coefficient for computing smoothed class distribution π in L_ACE (default: 0.5, slightly reduced for Non-IID class-missing compensation)')
     parser.add_argument('--a_ce_gamma', type=float, default=0.1,
                         help='SFD parameter: logit adjustment strength in L_ACE loss (default: 0.1)')
-    parser.add_argument('--scl_weight_start', type=float, default=0.1,
-                        help='Initial weight for L_A-SCL contrastive loss (default: 0.1)')
+    parser.add_argument('--scl_weight_start', type=float, default=1.0,
+                        help='Initial weight for L_A-SCL contrastive loss (default: 1.0, for contrastive learning weight annealing)')
     parser.add_argument('--scl_weight_end', type=float, default=0.0,
                         help='Final weight for L_A-SCL contrastive loss (cosine annealing target, default: 0.0)')
     parser.add_argument('--scl_temperature', type=float, default=0.07,

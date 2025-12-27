@@ -12,6 +12,7 @@ import logging
 import pickle
 import random
 import numpy as np
+import math
 
 # 将项目根目录添加到 sys.path
 import os
@@ -624,6 +625,14 @@ def FedMPS(args, train_dataset, test_dataset, user_groups, user_groups_lt, local
         loss_list_train = []
         loss_ace_list = []  # ABBL: Loss_ACE (L_ACE)
         loss_scl_list = []  # ABBL: Loss_SCL (L_A-SCL)
+        
+        # ABBL: 计算当前轮的 scl_weight（用于日志记录）
+        scl_weight_start = getattr(args, 'scl_weight_start', 1.0)
+        scl_weight_end = getattr(args, 'scl_weight_end', 0.0)
+        if args.rounds > 0:
+            scl_weight = 0.5 * (scl_weight_start - scl_weight_end) * (1 + math.cos(math.pi * round / args.rounds)) + scl_weight_end
+        else:
+            scl_weight = scl_weight_start
         for idx in idxs_users:
             # local model updating
             local_model = LocalUpdate(args=args, dataset=train_dataset, idxs=user_groups[idx])
@@ -790,14 +799,15 @@ def FedMPS(args, train_dataset, test_dataset, user_groups, user_groups_lt, local
             # begin training and output global logits
             global_logits = train_global_proto_model(global_model, train_dataloader)
 
-        # ABBL: 记录训练损失（包括 L_ACE 和 L_A-SCL）
-        print('| ROUND: {} | Train Loss - Total: {:.5f}, L_ACE: {:.5f}, L_A-SCL: {:.5f}'.format(
-            round, np.mean(loss_list_train), np.mean(loss_ace_list), np.mean(loss_scl_list)))
-        logger.info('| ROUND: {} | Train Loss - Total: {:.5f}, L_ACE: {:.5f}, L_A-SCL: {:.5f}'.format(
-            round, np.mean(loss_list_train), np.mean(loss_ace_list), np.mean(loss_scl_list)))
+        # ABBL: 记录训练损失（包括 L_ACE 和 L_A-SCL）以及权重退火
+        print('| ROUND: {} | Train Loss - Total: {:.5f}, L_ACE: {:.5f}, L_A-SCL: {:.5f}, SCL_Weight: {:.5f}'.format(
+            round, np.mean(loss_list_train), np.mean(loss_ace_list), np.mean(loss_scl_list), scl_weight))
+        logger.info('| ROUND: {} | Train Loss - Total: {:.5f}, L_ACE: {:.5f}, L_A-SCL: {:.5f}, SCL_Weight: {:.5f}'.format(
+            round, np.mean(loss_list_train), np.mean(loss_ace_list), np.mean(loss_scl_list), scl_weight))
         summary_writer.add_scalar('scalar/Train_Total_Loss', np.mean(loss_list_train), round)
         summary_writer.add_scalar('scalar/Train_Loss_ACE', np.mean(loss_ace_list), round)
         summary_writer.add_scalar('scalar/Train_Loss_SCL', np.mean(loss_scl_list), round)
+        summary_writer.add_scalar('scalar/SCL_Weight', scl_weight, round)  # ABBL: 记录权重退火变化
 
         # test
         acc_list_l, loss_list_l, acc_list_g, loss_list, loss_total_list = test_inference_new_het_lt(args,local_model_list,test_dataset,classes_list,user_groups_lt,global_high_protos)

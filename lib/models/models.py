@@ -38,6 +38,7 @@ class CNNMnist(nn.Module):
         logits = self.fc2(x)
         # Project high-level features for contrastive learning
         projected_features = self.projector(x1)
+        projected_features = F.normalize(projected_features, dim=1)
         return logits, F.log_softmax(logits, dim=1), x1, x_low, projected_features
 
 
@@ -70,6 +71,7 @@ class CNNFemnist(nn.Module):
         logits = self.fc2(x)
         # Project high-level features for contrastive learning
         projected_features = self.projector(x1)
+        projected_features = F.normalize(projected_features, dim=1)
         return logits, F.log_softmax(logits, dim=1), x1, x_low, projected_features
 
 
@@ -103,6 +105,7 @@ class CNNCifar(nn.Module):
         logits = self.fc2(x)
         # Project high-level features for contrastive learning
         projected_features = self.projector(x1)
+        projected_features = F.normalize(projected_features, dim=1)
         return logits, F.log_softmax(logits, dim=1), x1, x_low, projected_features
 
 class CNNFashion_Mnist(nn.Module):
@@ -138,6 +141,7 @@ class CNNFashion_Mnist(nn.Module):
         logits = self.fc(x1)
         # Project high-level features for contrastive learning
         projected_features = self.projector(x1)
+        projected_features = F.normalize(projected_features, dim=1)
         return logits, F.log_softmax(logits, dim=1), x1, x_low, projected_features
 
 
@@ -190,7 +194,7 @@ class ResNetWithFeatures(nn.Module):
         logits = self.fc(pooled)
         # Project high-level features for contrastive learning
         projected_features = self.projector(x_high)
-
+        projected_features = F.normalize(projected_features, dim=1)
         return logits, F.log_softmax(logits, dim=1), x_high, x_low, projected_features
 
 
