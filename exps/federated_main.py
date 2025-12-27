@@ -635,14 +635,6 @@ def FedMPS(args, train_dataset, test_dataset, user_groups, user_groups_lt, local
         global_high_protos = proto_aggregation(local_high_protos)
         global_low_protos = proto_aggregation(local_low_protos)
 
-        # global model training:
-        # create inputs: local high-level prototypes
-        global_data, global_label = get_global_input(local_high_protos)
-        dataset = TensorDataset(global_data, global_label)
-        train_dataloader = DataLoader(dataset, batch_size=4, shuffle=True)
-        # begin training and output global logits
-        global_logits = train_global_proto_model(global_model, train_dataloader)
-
         # ========== SFD Statistics Aggregation Stage ==========
         # Collect local statistics from all clients
         print(f'[Round {round+1}] Collecting local statistics from all clients...')
@@ -748,6 +740,34 @@ def FedMPS(args, train_dataset, test_dataset, user_groups, user_groups_lt, local
             # 例如：torch.save(class_syn_datasets, f'{logdir}/synthetic_features_round_{round+1}.pt')
         else:
             class_syn_datasets = None
+        
+        # ========== Global Model Training / Fine-tuning ==========
+        # 根据是否启用 SAFS 选择不同的全局模型训练方式
+        if getattr(args, 'enable_safs', 0) == 1 and class_syn_datasets is not None and len(class_syn_datasets) > 0:
+            # 使用 SAFS 合成特征微调全局模型
+            print(f'[Round {round+1}] Fine-tuning global model using SAFS synthetic features...')
+            logger.info(f'[Round {round+1}] Fine-tuning global model using SAFS synthetic features...')
+            
+            global_logits = fine_tune_global_model_safs(
+                args,
+                global_model,
+                class_syn_datasets,
+                global_high_protos  # 注意：FedMPS主要使用 high_protos 进行分类层训练
+            )
+            
+            print(f'[Round {round+1}] Global model fine-tuned using SAFS synthetic features.')
+            logger.info(f'[Round {round+1}] Global model fine-tuned using SAFS synthetic features.')
+        else:
+            # 使用原来的方法：基于本地原型训练全局模型
+            print(f'[Round {round+1}] Training global model using local prototypes...')
+            logger.info(f'[Round {round+1}] Training global model using local prototypes...')
+            
+            # create inputs: local high-level prototypes
+            global_data, global_label = get_global_input(local_high_protos)
+            dataset = TensorDataset(global_data, global_label)
+            train_dataloader = DataLoader(dataset, batch_size=4, shuffle=True)
+            # begin training and output global logits
+            global_logits = train_global_proto_model(global_model, train_dataloader)
 
         # test
         acc_list_l, loss_list_l, acc_list_g, loss_list, loss_total_list = test_inference_new_het_lt(args,local_model_list,test_dataset,classes_list,user_groups_lt,global_high_protos)

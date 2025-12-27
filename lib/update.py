@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 # Python version: 3.6
 
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, TensorDataset
 from lib.conloss import *
 from lib.utils import *
 from lib.ntdloss import *
@@ -1426,4 +1426,126 @@ def train_global_proto_model(global_model,train_dataloder):
     # global logits
     class_logits=agg_func(class_logits)
     return class_logits
+
+
+def fine_tune_global_model_safs(args, global_model, synthetic_data_list, global_protos):
+    """
+    利用 SAFS 合成特征微调全局模型，并生成全局 logits。
+    
+    该函数用于利用合成特征微调全局模型，并生成全局 logits。
+    
+    Args:
+        args: 参数对象
+        global_model: GlobalFedmps 实例
+        synthetic_data_list: feature_synthesis 返回的列表，包含 {'class_index', 'synthetic_features'}
+        global_protos: 全局原型字典 {class_index: [proto_tensor]}，用于生成最终的 global_logits
+    
+    Returns:
+        global_logits: 字典 {class_index: logit_tensor}，用于客户端蒸馏
+    """
+    device = args.device
+    global_model = global_model.to(device)
+    
+    # ========== 数据准备 ==========
+    # 遍历 synthetic_data_list，提取所有 synthetic_features (作为 X) 和对应的 class_index (作为 Y)
+    synthetic_features_list = []
+    synthetic_labels_list = []
+    
+    for syn_data in synthetic_data_list:
+        class_index = syn_data['class_index']
+        synthetic_features = syn_data['synthetic_features']  # shape: (syn_num, feature_dim)
+        
+        # 为每个合成特征创建对应的标签
+        num_syn = synthetic_features.shape[0]
+        labels = torch.full((num_syn,), class_index, dtype=torch.long)
+        
+        synthetic_features_list.append(synthetic_features)
+        synthetic_labels_list.append(labels)
+    
+    # 拼接所有特征和标签
+    if len(synthetic_features_list) == 0:
+        raise ValueError("synthetic_data_list 为空，无法进行微调")
+    
+    X_all = torch.cat(synthetic_features_list, dim=0)  # shape: (total_syn_num, feature_dim)
+    Y_all = torch.cat(synthetic_labels_list, dim=0)    # shape: (total_syn_num,)
+    
+    # 封装成 TensorDataset 和 DataLoader
+    dataset = TensorDataset(X_all, Y_all)
+    batch_size = getattr(args, 'safs_finetune_batch_size', 32)
+    train_dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    
+    # ========== 模型训练 (Fine-tuning) ==========
+    # 获取训练轮数，默认 5-10 个 epoch
+    epochs = getattr(args, 'safs_finetune_epochs', 5)
+    
+    # 使用 SGD 优化器，lr=0.01, momentum=0.9 (根据 SFD 论文)
+    optimizer = torch.optim.SGD(global_model.parameters(), lr=0.01, momentum=0.9)
+    loss_function = nn.CrossEntropyLoss()
+    
+    global_model.train()
+    for epoch in range(epochs):
+        num_correct = 0
+        num_samples = 0
+        epoch_loss = 0.0
+        num_batches = 0
+        
+        for features, labels in train_dataloader:
+            features = features.to(device)  # shape: (batch_size, feature_dim)
+            labels = labels.to(device)       # shape: (batch_size,)
+            
+            optimizer.zero_grad()
+            
+            # 将特征输入到 global_model (注意：GlobalFedmps 接受 x1 作为输入)
+            out = global_model.forward(features)
+            
+            # 计算损失
+            loss = loss_function(out, labels)
+            loss.backward()
+            optimizer.step()
+            
+            # 计算准确率
+            pred = out.max(1).indices
+            num_correct += (pred == labels).sum().item()
+            num_samples += labels.size(0)
+            epoch_loss += loss.item()
+            num_batches += 1
+        
+        acc = num_correct / num_samples if num_samples > 0 else 0.0
+        avg_loss = epoch_loss / num_batches if num_batches > 0 else 0.0
+        print(f"SAFS fine-tuning epoch {epoch+1}/{epochs}, train acc={acc:.4f}, loss={avg_loss:.4f}")
+    
+    # ========== 生成 Global Logits ==========
+    # 微调完成后，将模型设为 eval() 模式
+    global_model.eval()
+    
+    global_logits = {}
+    
+    with torch.no_grad():
+        # 遍历 global_protos（这是本轮聚合后的全局原型）
+        for class_index, proto_list in global_protos.items():
+            # 如果一个类别有多个原型，取平均
+            if len(proto_list) > 0:
+                # 将原型列表转换为张量
+                proto_tensor = torch.stack(proto_list) if isinstance(proto_list, list) else proto_list
+                
+                # 如果有多个原型，取平均
+                if proto_tensor.dim() > 1 and proto_tensor.shape[0] > 1:
+                    proto_tensor = proto_tensor.mean(dim=0, keepdim=True)
+                elif proto_tensor.dim() == 1:
+                    proto_tensor = proto_tensor.unsqueeze(0)
+                
+                # 移动到设备
+                proto_tensor = proto_tensor.to(device)
+                
+                # 将全局原型输入到微调后的 global_model 中，获取输出 logits
+                logit = global_model.forward(proto_tensor)  # shape: (1, num_classes)
+                
+                # 取第一个（也是唯一的）logit
+                logit = logit.squeeze(0)  # shape: (num_classes,)
+                
+                global_logits[class_index] = logit
+    
+    print(f"Generated global logits for {len(global_logits)} classes using SAFS fine-tuned model")
+    
+    return global_logits
 

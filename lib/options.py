@@ -114,6 +114,10 @@ def args_parser():
                         help='Jitter for target covariance matrix in MeanCov Aligner (default: 1e-5)')
     parser.add_argument('--safs_input_cov_eps', type=float, default=1e-5, 
                         help='Jitter for input covariance matrix in MeanCov Aligner (default: 1e-5)')
+    parser.add_argument('--safs_finetune_epochs', type=int, default=5, 
+                        help='Number of epochs for SAFS global model fine-tuning (default: 5)')
+    parser.add_argument('--safs_finetune_batch_size', type=int, default=32, 
+                        help='Batch size for SAFS global model fine-tuning (default: 32)')
 
     args = parser.parse_args()
     return args
