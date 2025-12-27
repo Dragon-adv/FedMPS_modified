@@ -12,7 +12,6 @@ import logging
 import pickle
 import random
 import numpy as np
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # 将项目根目录添加到 sys.path
 import os
@@ -603,27 +602,13 @@ def FedMPS(args, train_dataset, test_dataset, user_groups, user_groups_lt, local
     # Initialize global_stats to store the last round's statistics
     global_stats = None
     
-    # Set default max_workers for parallel client training
-    max_workers = getattr(args, 'max_workers', 10)
-    
     for round in tqdm(range(args.rounds)):
         local_weights, local_losses, local_high_protos, local_low_protos = [], [], {}, {}
         print(f'\n | Global Training Round : {round + 1} |\n')
 
         acc_list_train = []
         loss_list_train = []
-        
-        # Define train_client_batch function inside the loop to capture current round
-        def train_client_batch(idx):
-            """
-            训练单个客户端的辅助函数，用于并行执行。
-            
-            参数:
-                idx: 客户端索引
-                
-            返回:
-                tuple: (idx, w, loss, acc, high_protos, low_protos, agg_high_protos, agg_low_protos, idx_acc)
-            """
+        for idx in idxs_users:
             # local model updating
             local_model = LocalUpdate(args=args, dataset=train_dataset, idxs=user_groups[idx])
             w, loss, acc, high_protos, low_protos, idx_acc = local_model.update_weights_fedmps(
@@ -631,46 +616,14 @@ def FedMPS(args, train_dataset, test_dataset, user_groups, user_groups_lt, local
                 model=copy.deepcopy(local_model_list[idx]), global_round=round,
                 rf_models=rf_models, global_stats=global_stats
             )
+            acc_list_train.append(idx_acc)
+            loss_list_train.append(loss['total'])
             agg_high_protos = agg_func(high_protos)
             agg_low_protos = agg_func(low_protos)
-            return (idx, w, loss, acc, high_protos, low_protos, agg_high_protos, agg_low_protos, idx_acc)
-        
-        # Parallel client training using ThreadPoolExecutor
-        # Use a dictionary to store results by idx for proper ordering
-        results_dict = {}
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Submit all client training tasks
-            future_to_idx = {executor.submit(train_client_batch, idx): idx for idx in idxs_users}
-            
-            # Collect results as they complete
-            for future in as_completed(future_to_idx):
-                try:
-                    idx, w, loss, acc, high_protos, low_protos, agg_high_protos, agg_low_protos, idx_acc = future.result()
-                    results_dict[idx] = {
-                        'w': w,
-                        'loss': loss,
-                        'acc': acc,
-                        'high_protos': high_protos,
-                        'low_protos': low_protos,
-                        'agg_high_protos': agg_high_protos,
-                        'agg_low_protos': agg_low_protos,
-                        'idx_acc': idx_acc
-                    }
-                except Exception as exc:
-                    idx = future_to_idx[future]
-                    print(f'Client {idx} generated an exception: {exc}')
-                    logger.error(f'Client {idx} generated an exception: {exc}')
-        
-        # Aggregate results in the order of idxs_users
-        for idx in idxs_users:
-            if idx in results_dict:
-                result = results_dict[idx]
-                acc_list_train.append(result['idx_acc'])
-                loss_list_train.append(result['loss']['total'])
-                local_weights.append(copy.deepcopy(result['w']))
-                local_losses.append(copy.deepcopy(result['loss']['total']))
-                local_high_protos[idx] = result['agg_high_protos']
-                local_low_protos[idx] = result['agg_low_protos']
+            local_weights.append(copy.deepcopy(w))
+            local_losses.append(copy.deepcopy(loss['total']))
+            local_high_protos[idx] = agg_high_protos
+            local_low_protos[idx] = agg_low_protos
 
         # aggregate local multi-level prototypes instead of local weights
         local_weights_list = local_weights
