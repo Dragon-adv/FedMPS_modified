@@ -447,13 +447,22 @@ def get_safs_params(args, level='high'):
     """
     if level == 'low':
         # 低级特征专用参数，如果未设置则使用高级特征参数
+        # 使用 hasattr 检查属性是否存在，如果不存在则使用高级特征参数
+        def get_param(low_attr, high_attr, default_val):
+            if hasattr(args, low_attr):
+                return getattr(args, low_attr)
+            elif hasattr(args, high_attr):
+                return getattr(args, high_attr)
+            else:
+                return default_val
+        
         return {
-            'steps': getattr(args, 'safs_steps_low', None) or getattr(args, 'safs_steps', 200),
-            'lr': getattr(args, 'safs_lr_low', None) or getattr(args, 'safs_lr', 0.1),
-            'max_syn_num': getattr(args, 'safs_max_syn_num_low', None) or getattr(args, 'safs_max_syn_num', 600),
-            'min_syn_num': getattr(args, 'safs_min_syn_num_low', None) or getattr(args, 'safs_min_syn_num', 600),
-            'target_cov_eps': getattr(args, 'safs_target_cov_eps_low', None) or getattr(args, 'safs_target_cov_eps', 1e-5),
-            'input_cov_eps': getattr(args, 'safs_input_cov_eps_low', None) or getattr(args, 'safs_input_cov_eps', 1e-5),
+            'steps': get_param('safs_steps_low', 'safs_steps', 200),
+            'lr': get_param('safs_lr_low', 'safs_lr', 0.1),
+            'max_syn_num': get_param('safs_max_syn_num_low', 'safs_max_syn_num', 600),
+            'min_syn_num': get_param('safs_min_syn_num_low', 'safs_min_syn_num', 600),
+            'target_cov_eps': get_param('safs_target_cov_eps_low', 'safs_target_cov_eps', 1e-5),
+            'input_cov_eps': get_param('safs_input_cov_eps_low', 'safs_input_cov_eps', 1e-5),
         }
     else:  # level == 'high'
         # 高级特征参数
@@ -1060,9 +1069,39 @@ def FedMPS(args, train_dataset, test_dataset, user_groups, user_groups_lt, local
         local_weights, local_losses, local_high_protos, local_low_protos = [], [], {}, {}
         print(f'\n | Global Training Round : {round + 1} |\n')
         
+        # ========== 从 args 获取所有配置参数（在 Round 循环顶部统一获取） ==========
+        # ABBL: SCL 权重退火参数
+        scl_weight_start = getattr(args, 'scl_weight_start', 1.0)
+        scl_weight_end = getattr(args, 'scl_weight_end', 0.0)
+        
+        # SAFS 相关配置
+        enable_safs = getattr(args, 'enable_safs', 0) == 1
+        safs_synthesis_level = getattr(args, 'safs_synthesis_level', 'high')
+        enable_synthetic_low = getattr(args, 'enable_synthetic_low_features', 0) == 1
+        enable_client_syn = getattr(args, 'enable_client_synthetic_features', 1)
+        use_global_classifier = getattr(args, 'use_global_classifier', 1) == 1
+        
+        # 统计量计算层级（依赖于 enable_synthetic_low 和 safs_synthesis_level）
+        if enable_synthetic_low and safs_synthesis_level in ['low', 'both']:
+            # 如果启用合成低级特征训练，需要计算 low-level 统计量
+            if safs_synthesis_level == 'low':
+                stats_level = 'low'
+            else:  # 'both'
+                stats_level = 'both'
+        else:
+            stats_level = getattr(args, 'stats_level', 'high')
+        
+        # ABBL: 计算当前轮的 scl_weight（用于日志记录）
+        if args.rounds > 0:
+            scl_weight = 0.5 * (scl_weight_start - scl_weight_end) * (1 + math.cos(math.pi * round / args.rounds)) + scl_weight_end
+        else:
+            scl_weight = scl_weight_start
+        
         # 初始化客户端合成特征数据集（将在生成合成特征后更新）
         client_synthetic_datasets = {idx: None for idx in range(args.num_users)}
-
+        client_synthetic_low_datasets = {idx: None for idx in range(args.num_users)}
+        
+        # 初始化训练损失列表
         acc_list_train = []
         loss_list_train = []
         loss_ace_list = []  # ABBL: Loss_ACE (L_ACE)
@@ -1071,13 +1110,6 @@ def FedMPS(args, train_dataset, test_dataset, user_groups, user_groups_lt, local
         loss_proto_low_list = []   # FedMPS: Loss_proto_low (L_proto_low)
         loss_soft_list = []        # FedMPS: Loss_soft (L_soft)
         
-        # ABBL: 计算当前轮的 scl_weight（用于日志记录）
-        scl_weight_start = getattr(args, 'scl_weight_start', 1.0)
-        scl_weight_end = getattr(args, 'scl_weight_end', 0.0)
-        if args.rounds > 0:
-            scl_weight = 0.5 * (scl_weight_start - scl_weight_end) * (1 + math.cos(math.pi * round / args.rounds)) + scl_weight_end
-        else:
-            scl_weight = scl_weight_start
         for idx in idxs_users:
             # local model updating
             # 获取该客户端的合成特征数据集（如果启用）
@@ -1125,19 +1157,7 @@ def FedMPS(args, train_dataset, test_dataset, user_groups, user_groups_lt, local
         print(f'[Round {round+1}] Collecting local statistics from all clients...')
         logger.info(f'[Round {round+1}] Collecting local statistics from all clients...')
         
-        # 获取统计量计算层级（从 args 中获取，默认为 'high'）
-        # 如果启用了合成低级特征训练，优先使用 'low' 或 'both'
-        safs_synthesis_level = getattr(args, 'safs_synthesis_level', 'high')
-        enable_synthetic_low = getattr(args, 'enable_synthetic_low_features', 0) == 1
-        
-        if enable_synthetic_low and safs_synthesis_level in ['low', 'both']:
-            # 如果启用合成低级特征训练，需要计算 low-level 统计量
-            if safs_synthesis_level == 'low':
-                stats_level = 'low'
-            else:  # 'both'
-                stats_level = 'both'
-        else:
-            stats_level = getattr(args, 'stats_level', 'high')
+        # 注意：stats_level 已在循环顶部根据配置计算完成
         
         client_responses = []
         for idx in idxs_users:
@@ -1165,7 +1185,7 @@ def FedMPS(args, train_dataset, test_dataset, user_groups, user_groups_lt, local
         
         # ========== SFD SAFS Feature Synthesis Stage ==========
         # 如果启用了 SAFS，执行特征合成
-        if getattr(args, 'enable_safs', 0) == 1:
+        if enable_safs:
             print(f'[Round {round+1}] Starting SAFS feature synthesis...')
             logger.info(f'[Round {round+1}] Starting SAFS feature synthesis...')
             
@@ -1311,8 +1331,7 @@ def FedMPS(args, train_dataset, test_dataset, user_groups, user_groups_lt, local
                     logger.info(f'[Round {round+1}] Also generated synthetic low-level features for {len(class_syn_low_datasets)} classes')
             
             # ========== 为客户端分配合成特征 ==========
-            # 检查是否启用客户端使用合成特征
-            enable_client_syn = getattr(args, 'enable_client_synthetic_features', 1)
+            # 注意：enable_client_syn 已在循环顶部获取
             if enable_client_syn == 1 and class_syn_datasets is not None:
                 print(f'[Round {round+1}] Distributing synthetic high-level features to clients...')
                 logger.info(f'[Round {round+1}] Distributing synthetic high-level features to clients...')
@@ -1363,7 +1382,8 @@ def FedMPS(args, train_dataset, test_dataset, user_groups, user_groups_lt, local
         
         # ========== Global Model Training / Fine-tuning ==========
         # 根据是否启用 SAFS 选择不同的全局模型训练方式
-        if getattr(args, 'enable_safs', 0) == 1 and class_syn_datasets is not None and len(class_syn_datasets) > 0:
+        # 注意：enable_safs 已在循环顶部获取
+        if enable_safs and class_syn_datasets is not None and len(class_syn_datasets) > 0:
             # 使用 SAFS 合成特征微调全局模型
             print(f'[Round {round+1}] Fine-tuning global model using SAFS synthetic features...')
             logger.info(f'[Round {round+1}] Fine-tuning global model using SAFS synthetic features...')
@@ -1394,9 +1414,8 @@ def FedMPS(args, train_dataset, test_dataset, user_groups, user_groups_lt, local
         
         # ========== 从训练好的全局模型中提取分类头 ==========
         # 注意：全局模型已经通过上面的训练过程更新，所以直接从中提取分类头即可
+        # 注意：use_global_classifier 和 enable_synthetic_low 已在循环顶部获取
         global_classifier_state_dict = None
-        use_global_classifier = getattr(args, 'use_global_classifier', 1) == 1
-        enable_synthetic_low = getattr(args, 'enable_synthetic_low_features', 0) == 1
         if enable_synthetic_low and use_global_classifier:
             print(f'[Round {round+1}] Extracting global classifier head from trained global model...')
             logger.info(f'[Round {round+1}] Extracting global classifier head from trained global model...')

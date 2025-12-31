@@ -2455,20 +2455,38 @@ def fine_tune_global_model_safs(args, global_model, synthetic_data_list, global_
     global_model = global_model.to(device)
     
     # ========== 数据准备 ==========
-    # 遍历 synthetic_data_list，提取所有 synthetic_features (作为 X) 和对应的 class_index (作为 Y)
+    # 获取样本使用策略
+    strategy = getattr(args, 'safs_global_classifier_sample_strategy', 'all')
+    
     synthetic_features_list = []
     synthetic_labels_list = []
+    class_sample_counts = {}  # 记录每个类别使用的样本数量
     
-    for syn_data in synthetic_data_list:
-        class_index = syn_data['class_index']
-        synthetic_features = syn_data['synthetic_features']  # shape: (syn_num, feature_dim)
-        
-        # 为每个合成特征创建对应的标签
-        num_syn = synthetic_features.shape[0]
-        labels = torch.full((num_syn,), class_index, dtype=torch.long)
-        
-        synthetic_features_list.append(synthetic_features)
-        synthetic_labels_list.append(labels)
+    if strategy == 'all':
+        # 策略：使用所有合成特征
+        for syn_data in synthetic_data_list:
+            class_index = syn_data['class_index']
+            synthetic_features = syn_data['synthetic_features']  # shape: (syn_num, feature_dim)
+            
+            # 为每个合成特征创建对应的标签
+            num_syn = synthetic_features.shape[0]
+            labels = torch.full((num_syn,), class_index, dtype=torch.long)
+            
+            synthetic_features_list.append(synthetic_features)
+            synthetic_labels_list.append(labels)
+            class_sample_counts[class_index] = num_syn
+            
+        if logger is not None:
+            logger.info(f"Global classifier training strategy: 'all' - using all synthetic features")
+            logger.info(f"Sample counts per class: {class_sample_counts}")
+        print(f"Global classifier training strategy: 'all' - using all synthetic features")
+        print(f"Sample counts per class: {class_sample_counts}")
+    elif strategy == 'balanced':
+        # 预留：平衡采样策略（每个类别相同数量）
+        # TODO: 后续实现
+        raise NotImplementedError(f"Strategy 'balanced' is not yet implemented. Please use 'all' for now.")
+    else:
+        raise ValueError(f"Unknown global classifier sample strategy: {strategy}. Supported strategies: ['all']")
     
     # 拼接所有特征和标签
     if len(synthetic_features_list) == 0:

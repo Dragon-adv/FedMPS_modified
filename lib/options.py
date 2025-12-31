@@ -202,6 +202,11 @@ def args_parser():
                         help='Strategy for distributing synthetic features: max (all classes to max samples), min_ratio (missing classes to 80%% of min class, default: max)')
     parser.add_argument('--synthetic_feature_min_ratio', type=float, default=0.8,
                         help='Ratio for min_ratio strategy: missing classes will be supplemented to (min_class_samples * ratio), only used when strategy is min_ratio (default: 0.8)')
+    
+    # for Global Classifier Training Sample Strategy
+    parser.add_argument('--safs_global_classifier_sample_strategy', type=str, default='all',
+                        choices=['all'],
+                        help='Strategy for sampling synthetic features when training global classifier: all (use all synthetic features, default: all). More strategies (e.g., balanced) can be added in the future.')
 
     args = parser.parse_args()
     return args
