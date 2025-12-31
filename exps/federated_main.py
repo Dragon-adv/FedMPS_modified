@@ -7,6 +7,7 @@ from tqdm import tqdm
 from tensorboardX import SummaryWriter
 from pathlib import Path
 from torch.utils.data import TensorDataset
+import torch
 import datetime
 import logging
 import pickle
@@ -433,13 +434,14 @@ def Fedproc(args, train_dataset, test_dataset, user_groups, user_groups_lt, loca
         best_round, best_acc, best_std))
 
 
-def distribute_synthetic_features_to_clients(args, class_syn_datasets, user_groups, classes_list, train_dataset, logger=None):
+def distribute_synthetic_features_to_clients(args, class_syn_datasets, user_groups, classes_list, train_dataset, global_sample_per_class=None, logger=None):
     """
     为每个客户端分配合成特征。
     
     分配策略：
-    - 对于客户端缺失的类别：分配该类别的所有合成特征
-    - 对于客户端已有的类别：补充少量合成样本，使每个类别的数据量基本一致
+    - 对于每个类别，计算目标样本数（全局该类别的平均样本数）
+    - 对于客户端缺失的类别：补充到目标样本数（该类只有合成数据）
+    - 对于客户端已有的类别：补充到目标样本数
     
     Args:
         args: 参数对象
@@ -447,6 +449,7 @@ def distribute_synthetic_features_to_clients(args, class_syn_datasets, user_grou
         user_groups: 客户端数据索引字典 {client_id: sample_indices}
         classes_list: 每个客户端拥有的类别列表 [client_classes]
         train_dataset: 训练数据集，用于统计每个客户端的类别数据量
+        global_sample_per_class: 全局每个类别的总样本数，形状 (num_classes,)。如果为None，则使用客户端内最大样本数
         logger: Logger 实例，可选
     
     Returns:
@@ -456,6 +459,14 @@ def distribute_synthetic_features_to_clients(args, class_syn_datasets, user_grou
     
     num_clients = args.num_users
     num_classes = args.num_classes
+    
+    # 计算每个类别的目标样本数（全局平均）
+    if global_sample_per_class is not None:
+        # 使用全局每个类别的平均样本数作为目标
+        target_samples_per_class = (global_sample_per_class.float() / num_clients).ceil().long()
+    else:
+        # 如果没有提供全局统计，则使用None（将在每个客户端内部计算）
+        target_samples_per_class = None
     
     # 将 class_syn_datasets 转换为字典格式，便于访问
     syn_features_dict = {}
@@ -492,9 +503,11 @@ def distribute_synthetic_features_to_clients(args, class_syn_datasets, user_grou
         else:
             real_samples_per_class = torch.zeros(num_classes, dtype=torch.long)
         
-        # 计算该客户端所有类别的最大数据量
-        client_real_samples = real_samples_per_class[list(client_classes)].tolist()
-        max_samples = max(client_real_samples) if len(client_real_samples) > 0 else 0
+        # 如果没有提供全局统计，则使用该客户端所有类别的最大数据量作为目标
+        if target_samples_per_class is None:
+            client_real_samples = real_samples_per_class[list(client_classes)].tolist()
+            default_target = max(client_real_samples) if len(client_real_samples) > 0 else 0
+            target_samples_per_class = torch.full((num_classes,), default_target, dtype=torch.long)
         
         # 为该客户端分配合成特征
         client_syn_features = {}
@@ -506,30 +519,28 @@ def distribute_synthetic_features_to_clients(args, class_syn_datasets, user_grou
             available_syn_features = syn_features_dict[class_idx]  # shape: (syn_num, feature_dim)
             available_count = available_syn_features.shape[0]
             
-            if class_idx not in client_classes:
-                # 缺失类别：使用全部合成特征
-                client_syn_features[class_idx] = available_syn_features
+            # 获取该类别的目标样本数
+            target_count = int(target_samples_per_class[class_idx].item())
+            real_count = int(real_samples_per_class[class_idx].item())
+            
+            # 计算需要补充的数量
+            needed = max(0, target_count - real_count)
+            take = min(needed, available_count)
+            
+            if take > 0:
+                # 随机采样 take 个合成特征
+                indices = torch.randperm(available_count)[:take]
+                selected_features = available_syn_features[indices]
+                client_syn_features[class_idx] = selected_features
                 if logger:
-                    logger.info(f'Client {client_id}: Class {class_idx} (missing) - allocated all {available_count} synthetic features')
+                    status = "missing" if class_idx not in client_classes else "existing"
+                    logger.info(f'Client {client_id}: Class {class_idx} ({status}) - real: {real_count}, target: {target_count}, needed: {needed}, allocated: {take} synthetic features')
             else:
-                # 已有类别：补充到 max_samples
-                real_count = int(real_samples_per_class[class_idx].item())
-                needed = max(0, max_samples - real_count)
-                take = min(needed, available_count)
-                
-                if take > 0:
-                    # 随机采样 take 个合成特征
-                    indices = torch.randperm(available_count)[:take]
-                    selected_features = available_syn_features[indices]
-                    client_syn_features[class_idx] = selected_features
-                    if logger:
-                        logger.info(f'Client {client_id}: Class {class_idx} (existing) - real: {real_count}, needed: {needed}, allocated: {take} synthetic features')
-                else:
-                    # 不需要补充，但仍然可以分配少量用于增强（可选）
-                    # 这里不分配，保持原有数据分布
-                    client_syn_features[class_idx] = None
-                    if logger:
-                        logger.info(f'Client {client_id}: Class {class_idx} (existing) - real: {real_count}, max: {max_samples}, no synthetic features needed')
+                # 不需要补充（已有样本数已达到或超过目标）
+                client_syn_features[class_idx] = None
+                if logger:
+                    status = "missing" if class_idx not in client_classes else "existing"
+                    logger.info(f'Client {client_id}: Class {class_idx} ({status}) - real: {real_count}, target: {target_count}, no synthetic features needed')
         
         # 创建 SyntheticFeatureDataset
         # 过滤掉 None 值
@@ -597,8 +608,10 @@ def distribute_synthetic_low_features_to_clients(args, class_syn_low_datasets, u
     为每个客户端分配合成的低级特征。
     
     分配策略：
-    - 对于客户端缺失的类别：分配该类别的所有合成低级特征
-    - 对于客户端已有的类别：补充少量合成样本，使每个类别的数据量基本一致
+    - 对于每个客户端，计算该客户端拥有的类别的最大样本数作为目标
+    - 对于客户端缺失的类别：补充到目标样本数（该类只有合成数据）
+    - 对于客户端已有的类别：补充到目标样本数
+    - 这样，每个客户端的所有类别（包括缺失的类别）都会有相同的样本数
     
     Args:
         args: 参数对象
@@ -649,9 +662,11 @@ def distribute_synthetic_low_features_to_clients(args, class_syn_low_datasets, u
         else:
             real_samples_per_class = torch.zeros(num_classes, dtype=torch.long)
         
-        # 计算该客户端所有类别的最大数据量
+        # 计算该客户端拥有的类别的最大样本数作为目标
         client_real_samples = real_samples_per_class[list(client_classes)].tolist()
         max_samples = max(client_real_samples) if len(client_real_samples) > 0 else 0
+        # 所有类别都使用这个最大值作为目标
+        target_samples_per_class = torch.full((num_classes,), max_samples, dtype=torch.long)
         
         # 为该客户端分配合成的低级特征
         client_syn_low_features = {}
@@ -663,28 +678,28 @@ def distribute_synthetic_low_features_to_clients(args, class_syn_low_datasets, u
             available_syn_low_features = syn_low_features_dict[class_idx]  # shape: (syn_num, low_feature_dim)
             available_count = available_syn_low_features.shape[0]
             
-            if class_idx not in client_classes:
-                # 缺失类别：使用全部合成低级特征
-                client_syn_low_features[class_idx] = available_syn_low_features
+            # 获取该类别的目标样本数
+            target_count = int(target_samples_per_class[class_idx].item())
+            real_count = int(real_samples_per_class[class_idx].item())
+            
+            # 计算需要补充的数量
+            needed = max(0, target_count - real_count)
+            take = min(needed, available_count)
+            
+            if take > 0:
+                # 随机采样 take 个合成低级特征
+                indices = torch.randperm(available_count)[:take]
+                selected_features = available_syn_low_features[indices]
+                client_syn_low_features[class_idx] = selected_features
                 if logger:
-                    logger.info(f'Client {client_id}: Class {class_idx} (missing) - allocated all {available_count} synthetic low-level features')
+                    status = "missing" if class_idx not in client_classes else "existing"
+                    logger.info(f'Client {client_id}: Class {class_idx} ({status}) - real: {real_count}, target: {target_count}, needed: {needed}, allocated: {take} synthetic low-level features')
             else:
-                # 已有类别：补充到 max_samples
-                real_count = int(real_samples_per_class[class_idx].item())
-                needed = max(0, max_samples - real_count)
-                take = min(needed, available_count)
-                
-                if take > 0:
-                    # 随机采样 take 个合成低级特征
-                    indices = torch.randperm(available_count)[:take]
-                    selected_features = available_syn_low_features[indices]
-                    client_syn_low_features[class_idx] = selected_features
-                    if logger:
-                        logger.info(f'Client {client_id}: Class {class_idx} (existing) - real: {real_count}, needed: {needed}, allocated: {take} synthetic low-level features')
-                else:
-                    client_syn_low_features[class_idx] = None
-                    if logger:
-                        logger.info(f'Client {client_id}: Class {class_idx} (existing) - real: {real_count}, max: {max_samples}, no synthetic low-level features needed')
+                # 不需要补充（已有样本数已达到或超过目标）
+                client_syn_low_features[class_idx] = None
+                if logger:
+                    status = "missing" if class_idx not in client_classes else "existing"
+                    logger.info(f'Client {client_id}: Class {class_idx} ({status}) - real: {real_count}, target: {target_count}, no synthetic low-level features needed')
         
         # 创建 SyntheticLowLevelFeatureDataset
         client_syn_low_features_filtered = {k: v for k, v in client_syn_low_features.items() if v is not None}
@@ -1151,12 +1166,18 @@ def FedMPS(args, train_dataset, test_dataset, user_groups, user_groups_lt, local
                 print(f'[Round {round+1}] Distributing synthetic high-level features to clients...')
                 logger.info(f'[Round {round+1}] Distributing synthetic high-level features to clients...')
                 
+                # 获取全局每个类别的样本数（用于计算目标样本数）
+                global_sample_per_class_tensor = None
+                if 'sample_per_class' in global_stats:
+                    global_sample_per_class_tensor = torch.tensor(global_stats['sample_per_class'], dtype=torch.long)
+                
                 client_synthetic_datasets = distribute_synthetic_features_to_clients(
                     args=args,
                     class_syn_datasets=class_syn_datasets,
                     user_groups=user_groups,
                     classes_list=classes_list,
                     train_dataset=train_dataset,
+                    global_sample_per_class=global_sample_per_class_tensor,
                     logger=logger
                 )
                 
