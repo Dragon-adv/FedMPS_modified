@@ -168,5 +168,18 @@ def args_parser():
     parser.add_argument('--synthetic_soft_weight', type=float, default=None,
                         help='Weight coefficient for soft label distillation loss on synthetic data (default: None, uses --gama value if not specified, independent from real data)')
 
+    # for Synthetic Low-Level Features Training
+    parser.add_argument('--enable_synthetic_low_features', type=int, default=0,
+                        help='Enable synthetic low-level features training (0: disabled, 1: enabled, default: 0)')
+    parser.add_argument('--synthetic_low_feature_weight', type=float, default=1.0,
+                        help='Weight coefficient for losses on synthetic low-level features (default: 1.0)')
+    parser.add_argument('--freeze_low_encoder', type=int, default=1,
+                        help='Freeze low-level encoder when training with synthetic low-level features (0: disabled, 1: enabled, default: 1)')
+    parser.add_argument('--use_global_classifier', type=int, default=1,
+                        help='Use global classifier head when training with synthetic low-level features (0: disabled, 1: enabled, default: 1)')
+    parser.add_argument('--safs_synthesis_level', type=str, default='high',
+                        choices=['high', 'low', 'both'],
+                        help='Level of features to synthesize using SAFS: high (high-level), low (low-level), or both (default: high)')
+
     args = parser.parse_args()
     return args

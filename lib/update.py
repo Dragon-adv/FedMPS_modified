@@ -67,6 +67,48 @@ class SyntheticFeatureDataset(Dataset):
         return self.features[item], self.labels[item]
 
 
+class SyntheticLowLevelFeatureDataset(Dataset):
+    """
+    合成低级特征数据集类，用于包装合成的低级特征数据。
+    
+    合成的低级特征用于训练高级编码器（high-level encoder），
+    同时冻结低级编码器并使用全局分类头。
+    """
+    
+    def __init__(self, synthetic_low_features_dict):
+        """
+        Args:
+            synthetic_low_features_dict: 字典 {class_index: tensor}，每个类别的合成低级特征
+                tensor shape: (num_samples, low_feature_dim)
+        """
+        self.features = []
+        self.labels = []
+        
+        # 将字典转换为列表格式
+        for class_idx, features in synthetic_low_features_dict.items():
+            if features is not None and len(features) > 0:
+                num_samples = features.shape[0]
+                labels = torch.full((num_samples,), class_idx, dtype=torch.long)
+                self.features.append(features)
+                self.labels.append(labels)
+        
+        if len(self.features) > 0:
+            self.features = torch.cat(self.features, dim=0)
+            self.labels = torch.cat(self.labels, dim=0)
+        else:
+            # 空数据集
+            self.features = torch.empty(0)
+            self.labels = torch.empty(0, dtype=torch.long)
+    
+    def __len__(self):
+        return len(self.labels)
+    
+    def __getitem__(self, item):
+        # 返回 (low_feature, label)，其中 low_feature 是 low-level feature
+        # 注意：这里返回的是低级特征，不是图像
+        return self.features[item], self.labels[item]
+
+
 class MixedDataset(Dataset):
     """
     混合数据集类，用于混合真实图像数据和合成特征数据。
@@ -113,16 +155,18 @@ class LocalUpdate(object):
         3. 梯度计算与优化：管理本地模型在指定设备（GPU/CPU）上的反向传播、权重更新及指标计算。
         4. 结果反馈：向服务器返回更新后的模型状态字典（state_dict）及相关的算法元数据（如原型 Prototypes）。
     """
-    def __init__(self, args, dataset, idxs, synthetic_features_dataset=None):
+    def __init__(self, args, dataset, idxs, synthetic_features_dataset=None, synthetic_low_features_dataset=None):
         """
         Args:
             args: 参数对象
             dataset: 真实数据集
             idxs: 数据索引
-            synthetic_features_dataset: SyntheticFeatureDataset 实例，可选
+            synthetic_features_dataset: SyntheticFeatureDataset 实例，可选（高级特征）
+            synthetic_low_features_dataset: SyntheticLowLevelFeatureDataset 实例，可选（低级特征）
         """
         self.args = args
         self.synthetic_features_dataset = synthetic_features_dataset
+        self.synthetic_low_features_dataset = synthetic_low_features_dataset
         self.device = args.device
         self.criterion = nn.NLLLoss().to(self.device)   # Negative Log Likelihood Loss; nn.CrossEntropyLoss = nn.LogSoftmax + nn.NLLLoss
         self.ntd_criterion = NTD_Loss(args.num_classes, args.ntd_tau, args.ntd_beta)
@@ -130,6 +174,13 @@ class LocalUpdate(object):
         
         # 解耦 Batch 处理：维护两个独立的 DataLoader
         self.real_loader, self.syn_loader = self.train_val_test(dataset, list(idxs), synthetic_features_dataset)
+        
+        # 为合成低级特征创建独立的 DataLoader
+        self.syn_low_loader = None
+        if synthetic_low_features_dataset is not None and len(synthetic_low_features_dataset) > 0:
+            drop_last = bool(getattr(self.args, 'drop_last', 1))
+            self.syn_low_loader = DataLoader(synthetic_low_features_dataset,
+                                            batch_size=self.args.local_bs, shuffle=True, drop_last=drop_last)
         
         # 为了向后兼容，添加 trainloader 属性（指向 real_loader）
         self.trainloader = self.real_loader
@@ -729,7 +780,7 @@ class LocalUpdate(object):
         else:
             return torch.stack(mmd_losses).mean()
 
-    def update_weights_fedmps(self, args, idx, global_high_protos, global_low_protos, global_logits, model, global_round=0, total_rounds=None, rf_models=None, global_stats=None):
+    def update_weights_fedmps(self, args, idx, global_high_protos, global_low_protos, global_logits, model, global_round=0, total_rounds=None, rf_models=None, global_stats=None, global_classifier_state_dict=None):
         """
                 执行 FedMPS 算法的本地更新过程（集成 ABBL）。
 
@@ -795,6 +846,38 @@ class LocalUpdate(object):
         # 两阶段训练：检查是否需要冻结 Backbone
         enable_two_stage = getattr(args, 'enable_two_stage_training', 0)
         
+        # 检查是否启用合成低级特征训练
+        enable_synthetic_low = getattr(args, 'enable_synthetic_low_features', 0) == 1
+        freeze_low_encoder = getattr(args, 'freeze_low_encoder', 1) == 1
+        use_global_classifier = getattr(args, 'use_global_classifier', 1) == 1
+        
+        # 如果启用合成低级特征训练，冻结低级编码器和分类器，只训练高级编码器
+        if enable_synthetic_low and freeze_low_encoder:
+            for name, param in model.named_parameters():
+                # 冻结低级编码器（conv1, layer1, features 等）
+                if 'conv1' in name or 'layer1' in name or ('features' in name and 'layer2' not in name and 'layer3' not in name and 'layer4' not in name):
+                    param.requires_grad = False
+                
+                # 如果使用全局分类器，冻结本地分类器
+                if use_global_classifier:
+                    # 根据数据集类型冻结对应的分类器层
+                    dataset = args.dataset
+                    if dataset == 'mnist' or dataset == 'femnist':
+                        if 'fc2' in name:
+                            param.requires_grad = False
+                    elif dataset == 'cifar10' or dataset == 'realwaste' or dataset == 'flowers' or dataset == 'defungi':
+                        if 'fc1' in name or 'fc2' in name:
+                            param.requires_grad = False
+                    elif dataset == 'fashion':
+                        if 'fc' in name and 'projector' not in name:
+                            param.requires_grad = False
+                    elif dataset == 'tinyimagenet' or dataset == 'cifar100':
+                        if 'l2' in name or 'l3' in name:
+                            param.requires_grad = False
+                    elif dataset == 'imagenet':
+                        if 'fc' in name and 'projector' not in name:
+                            param.requires_grad = False
+        
         for epoch in range(self.args.train_ep):
             # 更新冻结状态（每个 epoch 开始时）
             if enable_two_stage == 1 and self.syn_loader is not None:
@@ -809,16 +892,43 @@ class LocalUpdate(object):
                     for param in model.parameters():
                         param.requires_grad = True
             
+            # 如果启用合成低级特征训练，确保低级编码器和分类器保持冻结
+            if enable_synthetic_low and freeze_low_encoder:
+                for name, param in model.named_parameters():
+                    # 冻结低级编码器
+                    if 'conv1' in name or 'layer1' in name or ('features' in name and 'layer2' not in name and 'layer3' not in name and 'layer4' not in name):
+                        param.requires_grad = False
+                    
+                    # 如果使用全局分类器，冻结本地分类器
+                    if use_global_classifier:
+                        dataset = args.dataset
+                        if dataset == 'mnist' or dataset == 'femnist':
+                            if 'fc2' in name:
+                                param.requires_grad = False
+                        elif dataset == 'cifar10' or dataset == 'realwaste' or dataset == 'flowers' or dataset == 'defungi':
+                            if 'fc1' in name or 'fc2' in name:
+                                param.requires_grad = False
+                        elif dataset == 'fashion':
+                            if 'fc' in name and 'projector' not in name:
+                                param.requires_grad = False
+                        elif dataset == 'tinyimagenet' or dataset == 'cifar100':
+                            if 'l2' in name or 'l3' in name:
+                                param.requires_grad = False
+                        elif dataset == 'imagenet':
+                            if 'fc' in name and 'projector' not in name:
+                                param.requires_grad = False
+            
             correct = 0
             total = 0
             batch_loss = {'total': [], 'ace': [], 'scl': [], 'proto_high': [], 'proto_low': [], 'soft': []}
             agg_high_protos_label = {}
             agg_low_protos_label = {}
             
-            # 解耦 Batch 处理：分别处理真实数据和合成数据
+            # 解耦 Batch 处理：分别处理真实数据、合成高级特征和合成低级特征
             # 创建迭代器
             real_iter = iter(self.real_loader)
             syn_iter = iter(self.syn_loader) if self.syn_loader is not None else None
+            syn_low_iter = iter(self.syn_low_loader) if self.syn_low_loader is not None else None
             
             batch_idx = 0
             while True:
@@ -828,7 +938,7 @@ class LocalUpdate(object):
                 except StopIteration:
                     real_batch = None
                 
-                # 尝试获取合成数据 batch
+                # 尝试获取合成高级特征 batch
                 syn_batch = None
                 if syn_iter is not None:
                     try:
@@ -836,8 +946,16 @@ class LocalUpdate(object):
                     except StopIteration:
                         syn_batch = None
                 
-                # 如果两个 batch 都为空，退出循环
-                if real_batch is None and syn_batch is None:
+                # 尝试获取合成低级特征 batch
+                syn_low_batch = None
+                if syn_low_iter is not None:
+                    try:
+                        syn_low_batch = next(syn_low_iter)
+                    except StopIteration:
+                        syn_low_batch = None
+                
+                # 如果所有 batch 都为空，退出循环
+                if real_batch is None and syn_batch is None and syn_low_batch is None:
                     break
                 # 处理真实图像数据
                 if real_batch is not None:
@@ -927,8 +1045,58 @@ class LocalUpdate(object):
                     correct += torch.eq(y_hat, labels.squeeze()).int().sum().item()
                     total += labels.size(0)
                 
+                # 处理合成低级特征数据
+                if syn_low_batch is not None:
+                    low_features, labels = syn_low_batch
+                    low_features, labels = low_features.to(self.device), labels.to(self.device)
+                    
+                    model.zero_grad()
+                    # 从 low-level features 开始前向传播
+                    logits, log_probs, high_protos, low_protos, projected_features = self.forward_from_low_features(
+                        model, low_features, args, global_classifier_state_dict if use_global_classifier else None
+                    )
+                    
+                    # 标记这是合成低级特征数据（用于损失计算）
+                    is_synthetic_low = True
+                    
+                    # 计算所有损失函数
+                    loss_ace, loss_scl, loss_proto_high, loss_proto_low, loss_soft = self.compute_losses(
+                        args, model, logits, log_probs, high_protos, low_protos, projected_features,
+                        labels, global_high_protos, global_low_protos, global_logits,
+                        scl_weight, is_synthetic=False  # 合成低级特征用于训练 encoder，所以不算 is_synthetic
+                    )
+                    
+                    # 获取合成低级特征的独立权重系数
+                    synthetic_low_weight = getattr(args, 'synthetic_low_feature_weight', 1.0)
+                    synthetic_soft_weight = getattr(args, 'synthetic_soft_weight', None)
+                    if synthetic_soft_weight is None:
+                        synthetic_soft_weight = args.gama
+                    
+                    # 总损失：包含所有损失函数
+                    # L_projector (loss_scl) + L_proto_high + L_ce (loss_ace) + L_distill (loss_soft)
+                    loss = synthetic_low_weight * (
+                        loss_ace + scl_weight * loss_scl + args.alph * loss_proto_high + synthetic_soft_weight * loss_soft
+                    )
+                    # 注意：loss_proto_low 对于合成低级特征应该为 0（因为 low_protos 就是输入的 low_features）
+                    
+                    loss.backward()
+                    optimizer.step()
+                    
+                    # 收集原型（只收集 high_protos）
+                    for i in range(len(labels)):
+                        if labels[i].item() in agg_high_protos_label:
+                            agg_high_protos_label[labels[i].item()].append(high_protos[i, :])
+                        else:
+                            agg_high_protos_label[labels[i].item()] = [high_protos[i, :]]
+                    
+                    log_probs = log_probs[:, 0:args.num_classes]
+                    _, y_hat = log_probs.max(1)
+                    acc_val = torch.eq(y_hat, labels.squeeze()).float().mean()
+                    correct += torch.eq(y_hat, labels.squeeze()).int().sum().item()
+                    total += labels.size(0)
+                
                 # 记录损失（只在有数据时记录）
-                if real_batch is not None or syn_batch is not None:
+                if real_batch is not None or syn_batch is not None or syn_low_batch is not None:
                     if self.args.verbose and (batch_idx % 10 == 0):
                         total_samples = len(self.real_loader.dataset) + (len(self.syn_loader.dataset) if self.syn_loader else 0)
                         processed = batch_idx * self.args.local_bs
@@ -1169,6 +1337,200 @@ class LocalUpdate(object):
             # 默认处理：假设 high_features 直接输入分类器
             # 这需要根据具体模型调整
             raise ValueError(f"Unsupported dataset for synthetic features: {dataset}")
+        
+        return logits, log_probs, high_level_features_raw, low_level_features_raw, projected_features
+
+    def forward_from_low_features(self, model, low_features, args, global_classifier_state_dict=None):
+        """
+        从 low-level features 开始前向传播，用于处理合成的低级特征。
+        
+        该函数用于训练高级编码器（high-level encoder），同时：
+        - 使用合成的低级特征作为输入
+        - 通过高级编码器生成高级特征
+        - 使用全局分类头进行分类
+        
+        Args:
+            model: 模型实例
+            low_features: low-level features tensor, shape (batch_size, low_feature_dim)
+            args: 参数对象，用于确定数据集类型
+            global_classifier_state_dict: 全局分类头的状态字典（可选），如果提供则使用全局分类头
+            
+        Returns:
+            (logits, log_probs, high_level_features_raw, low_level_features_raw, projected_features)
+            注意：low_level_features_raw 就是输入的 low_features
+        """
+        device = low_features.device
+        batch_size = low_features.shape[0]
+        
+        # 保存未归一化的低级特征
+        low_level_features_raw = low_features
+        
+        # 根据数据集类型确定模型结构
+        dataset = args.dataset
+        
+        if dataset == 'mnist' or dataset == 'femnist':
+            # CNNMnist/CNNFemnist: 
+            # low_features 应该是 conv2 输出的 flatten 版本（可以直接输入到 fc1）
+            # 对于 MNIST: conv2 输出 flatten 后是 (batch, 320/20*out_channels)，通常是 (batch, 160)
+            # 对于 FEMNIST: conv2 输出 flatten 后是 (batch, 16820/20*out_channels)
+            
+            # 检查维度是否匹配
+            if low_features.shape[1] != model.fc1.in_features:
+                raise ValueError(
+                    f"Low-level feature dimension {low_features.shape[1]} does not match fc1 input dimension {model.fc1.in_features}. "
+                    f"Please ensure low_features is the flattened output of conv2 (not conv1)."
+                )
+            
+            feat_high_encoded = F.relu(model.fc1(low_features))
+            high_level_features_raw = feat_high_encoded
+            high_level_features = F.normalize(feat_high_encoded, dim=1)
+            
+            # 使用全局分类头或本地分类头
+            if global_classifier_state_dict is not None:
+                # 临时加载全局分类头（冻结状态，不参与梯度更新，但允许梯度通过）
+                temp_fc2 = nn.Linear(model.fc2.in_features, model.fc2.out_features).to(device)
+                temp_fc2.load_state_dict({'weight': global_classifier_state_dict['fc2.weight'],
+                                         'bias': global_classifier_state_dict['fc2.bias']})
+                # 冻结全局分类头参数（不更新参数，但允许梯度通过）
+                for param in temp_fc2.parameters():
+                    param.requires_grad = False
+                # 注意：不使用 torch.no_grad()，因为需要梯度流回高级编码器
+                feat_for_classifier = F.dropout(high_level_features, training=model.training)
+                logits = temp_fc2(feat_for_classifier)
+            else:
+                feat_for_classifier = F.dropout(high_level_features, training=model.training)
+                logits = model.fc2(feat_for_classifier)
+            
+            log_probs = F.log_softmax(logits, dim=1)
+            proj_output = model.projector(high_level_features)
+            projected_features = F.normalize(proj_output, dim=1)
+            
+        elif dataset == 'cifar10' or dataset == 'realwaste' or dataset == 'flowers' or dataset == 'defungi':
+            # CNNCifar: 
+            # low_features (flattened conv2 output) -> fc0 -> fc1 -> fc2
+            # low_features 应该是 (batch, 16*5*5) = (batch, 400)
+            # 通过 fc0 得到 high-level features
+            feat_high_encoded = F.relu(model.fc0(low_features))
+            high_level_features_raw = feat_high_encoded
+            high_level_features = F.normalize(feat_high_encoded, dim=1)
+            
+            # 使用全局分类头或本地分类头
+            if global_classifier_state_dict is not None:
+                # 临时加载全局分类头（fc1 和 fc2），冻结状态
+                temp_fc1 = nn.Linear(model.fc1.in_features, model.fc1.out_features).to(device)
+                temp_fc2 = nn.Linear(model.fc2.in_features, model.fc2.out_features).to(device)
+                temp_fc1.load_state_dict({'weight': global_classifier_state_dict['fc1.weight'],
+                                         'bias': global_classifier_state_dict['fc1.bias']})
+                temp_fc2.load_state_dict({'weight': global_classifier_state_dict['fc2.weight'],
+                                         'bias': global_classifier_state_dict['fc2.bias']})
+                # 冻结全局分类头参数（不更新参数，但允许梯度通过）
+                for param in temp_fc1.parameters():
+                    param.requires_grad = False
+                for param in temp_fc2.parameters():
+                    param.requires_grad = False
+                # 注意：不使用 torch.no_grad()，因为需要梯度流回高级编码器
+                feat_for_classifier = F.relu(temp_fc1(high_level_features))
+                logits = temp_fc2(feat_for_classifier)
+            else:
+                feat_for_classifier = F.relu(model.fc1(high_level_features))
+                logits = model.fc2(feat_for_classifier)
+            
+            log_probs = F.log_softmax(logits, dim=1)
+            proj_output = model.projector(high_level_features)
+            projected_features = F.normalize(proj_output, dim=1)
+            
+        elif dataset == 'fashion':
+            # CNNFashion_Mnist: 
+            # low_features (flattened layer1 output) -> layer2 -> fc
+            # low_features 应该是 (batch, 16*14*14) = (batch, 3136)
+            # 需要通过 layer2 得到 high-level features
+            # 但 layer2 是卷积层，需要 reshape
+            # 假设 low_features 已经是 layer2 输出的 flatten 版本
+            # 对于 Fashion-MNIST: layer2 输出 flatten 后是 (batch, 7*7*32) = (batch, 1568)
+            
+            # 简化处理：假设 low_features 已经是 layer2 输出的 flatten 版本
+            high_level_features_raw = low_features  # 临时：假设 low_features 就是 high-level
+            high_level_features = F.normalize(low_features, dim=1)
+            
+            # 使用全局分类头或本地分类头
+            if global_classifier_state_dict is not None:
+                temp_fc = nn.Linear(model.fc.in_features, model.fc.out_features).to(device)
+                temp_fc.load_state_dict({'weight': global_classifier_state_dict['weight'],
+                                        'bias': global_classifier_state_dict['bias']})
+                # 冻结全局分类头参数（不更新参数，但允许梯度通过）
+                for param in temp_fc.parameters():
+                    param.requires_grad = False
+                # 注意：不使用 torch.no_grad()，因为需要梯度流回高级编码器
+                logits = temp_fc(high_level_features)
+            else:
+                logits = model.fc(high_level_features)
+            
+            log_probs = F.log_softmax(logits, dim=1)
+            proj_output = model.projector(high_level_features)
+            projected_features = F.normalize(proj_output, dim=1)
+            
+        elif dataset == 'tinyimagenet' or dataset == 'cifar100':
+            # ModelCT: 
+            # low_features (from features) -> l1 -> l2 -> l3
+            # low_features 应该是 (batch, feature_dim)
+            feat_high_encoded = model.l1(low_features)
+            feat_high_encoded = F.relu(feat_high_encoded)
+            high_level_features_raw = feat_high_encoded
+            high_level_features = F.normalize(feat_high_encoded, dim=1)
+            
+            # 使用全局分类头或本地分类头
+            if global_classifier_state_dict is not None:
+                temp_l2 = nn.Linear(model.l2.in_features, model.l2.out_features).to(device)
+                temp_l3 = nn.Linear(model.l3.in_features, model.l3.out_features).to(device)
+                temp_l2.load_state_dict({'weight': global_classifier_state_dict['l2.weight'],
+                                        'bias': global_classifier_state_dict['l2.bias']})
+                temp_l3.load_state_dict({'weight': global_classifier_state_dict['l3.weight'],
+                                        'bias': global_classifier_state_dict['l3.bias']})
+                # 冻结全局分类头参数（不更新参数，但允许梯度通过）
+                for param in temp_l2.parameters():
+                    param.requires_grad = False
+                for param in temp_l3.parameters():
+                    param.requires_grad = False
+                # 注意：不使用 torch.no_grad()，因为需要梯度流回高级编码器
+                feat_for_classifier = temp_l2(high_level_features)
+                logits = temp_l3(feat_for_classifier)
+            else:
+                feat_for_classifier = model.l2(high_level_features)
+                logits = model.l3(feat_for_classifier)
+            
+            log_probs = F.log_softmax(logits, dim=1)
+            proj_output = model.projector(high_level_features)
+            projected_features = F.normalize(proj_output, dim=1)
+            
+        elif dataset == 'imagenet':
+            # ResNetWithFeatures: 
+            # low_features (from layer1) -> layer2 -> layer3 -> layer4 -> fc
+            # low_features 应该是 (batch, C*H*W)，需要 reshape 回特征图格式
+            # 但这里简化处理，假设 low_features 已经是 layer4 输出的 flatten 版本
+            high_level_features_raw = low_features  # 临时：假设 low_features 就是 high-level
+            high_level_features = F.normalize(low_features, dim=1)
+            
+            # 使用全局分类头或本地分类头
+            if global_classifier_state_dict is not None:
+                temp_fc = nn.Linear(model.fc.in_features, model.fc.out_features).to(device)
+                temp_fc.load_state_dict({'weight': global_classifier_state_dict['weight'],
+                                        'bias': global_classifier_state_dict['bias']})
+                # 冻结全局分类头参数（不更新参数，但允许梯度通过）
+                for param in temp_fc.parameters():
+                    param.requires_grad = False
+                # 注意：不使用 torch.no_grad()，因为需要梯度流回高级编码器
+                logits = temp_fc(high_level_features_raw)  # fc 使用未归一化的
+            else:
+                logits = model.fc(high_level_features_raw)
+            
+            log_probs = F.log_softmax(logits, dim=1)
+            proj_output = model.projector(high_level_features)
+            projected_features = F.normalize(proj_output, dim=1)
+            
+        else:
+            # 默认处理：假设 low_features 可以直接输入到 high-level encoder
+            # 这需要根据具体模型调整
+            raise ValueError(f"Unsupported dataset for synthetic low-level features: {dataset}")
         
         return logits, log_probs, high_level_features_raw, low_level_features_raw, projected_features
 

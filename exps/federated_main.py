@@ -548,6 +548,160 @@ def distribute_synthetic_features_to_clients(args, class_syn_datasets, user_grou
     return client_synthetic_datasets
 
 
+def extract_classifier_from_global_model(global_model, args):
+    """
+    从训练好的全局模型中提取分类头的状态字典。
+    
+    注意：全局模型已经通过 fine_tune_global_model_safs 或 train_global_proto_model 
+    使用全局高级原型和合成数据进行了训练，所以直接从中提取分类头即可。
+    
+    Args:
+        global_model: 训练好的全局模型（GlobalFedmps 实例）
+        args: 参数对象
+    
+    Returns:
+        global_classifier_state_dict: 全局分类头的状态字典
+    """
+    # 根据数据集类型确定分类头的层名称
+    dataset = args.dataset
+    
+    if dataset == 'mnist' or dataset == 'femnist':
+        classifier_keys = ['fc2.weight', 'fc2.bias']
+    elif dataset == 'cifar10' or dataset == 'realwaste' or dataset == 'flowers' or dataset == 'defungi':
+        classifier_keys = ['fc1.weight', 'fc1.bias', 'fc2.weight', 'fc2.bias']
+    elif dataset == 'fashion':
+        classifier_keys = ['fc.weight', 'fc.bias']
+    elif dataset == 'tinyimagenet' or dataset == 'cifar100':
+        classifier_keys = ['l2.weight', 'l2.bias', 'l3.weight', 'l3.bias']
+    elif dataset == 'imagenet':
+        classifier_keys = ['fc.weight', 'fc.bias']
+    else:
+        raise ValueError(f"Unsupported dataset for global classifier extraction: {dataset}")
+    
+    # 从全局模型中提取分类头权重
+    global_classifier_state_dict = {}
+    global_state_dict = global_model.state_dict()
+    
+    for key in classifier_keys:
+        if key in global_state_dict:
+            global_classifier_state_dict[key] = global_state_dict[key]
+        else:
+            raise KeyError(f"Classifier key '{key}' not found in global model state dict. "
+                          f"Available keys: {list(global_state_dict.keys())}")
+    
+    return global_classifier_state_dict
+
+
+def distribute_synthetic_low_features_to_clients(args, class_syn_low_datasets, user_groups, classes_list, train_dataset, logger=None):
+    """
+    为每个客户端分配合成的低级特征。
+    
+    分配策略：
+    - 对于客户端缺失的类别：分配该类别的所有合成低级特征
+    - 对于客户端已有的类别：补充少量合成样本，使每个类别的数据量基本一致
+    
+    Args:
+        args: 参数对象
+        class_syn_low_datasets: feature_synthesis 返回的列表，包含 {'class_index', 'synthetic_features'}（低级特征）
+        user_groups: 客户端数据索引字典 {client_id: sample_indices}
+        classes_list: 每个客户端拥有的类别列表 [client_classes]
+        train_dataset: 训练数据集，用于统计每个客户端的类别数据量
+        logger: Logger 实例，可选
+    
+    Returns:
+        client_synthetic_low_datasets: 字典 {client_id: SyntheticLowLevelFeatureDataset}
+    """
+    from lib.update import SyntheticLowLevelFeatureDataset
+    
+    num_clients = args.num_users
+    num_classes = args.num_classes
+    
+    # 将 class_syn_low_datasets 转换为字典格式，便于访问
+    syn_low_features_dict = {}
+    for syn_data in class_syn_low_datasets:
+        class_idx = syn_data['class_index']
+        synthetic_low_features = syn_data['synthetic_features']  # shape: (syn_num, low_feature_dim)
+        syn_low_features_dict[class_idx] = synthetic_low_features
+    
+    # 为每个客户端分配合成的低级特征
+    client_synthetic_low_datasets = {}
+    
+    for client_id in range(num_clients):
+        client_classes = set(classes_list[client_id])  # 客户端拥有的类别
+        
+        # 统计该客户端每个类别的真实数据量
+        all_labels = []
+        client_idxs = user_groups[client_id]
+        for idx in client_idxs:
+            try:
+                _, label = train_dataset[int(idx)]
+                if isinstance(label, torch.Tensor):
+                    label_val = label.item() if label.numel() == 1 else int(label)
+                else:
+                    label_val = int(label)
+                all_labels.append(label_val)
+            except Exception:
+                continue
+        
+        if len(all_labels) > 0:
+            all_labels_tensor = torch.tensor(all_labels, dtype=torch.long)
+            real_samples_per_class = all_labels_tensor.bincount(minlength=num_classes)
+        else:
+            real_samples_per_class = torch.zeros(num_classes, dtype=torch.long)
+        
+        # 计算该客户端所有类别的最大数据量
+        client_real_samples = real_samples_per_class[list(client_classes)].tolist()
+        max_samples = max(client_real_samples) if len(client_real_samples) > 0 else 0
+        
+        # 为该客户端分配合成的低级特征
+        client_syn_low_features = {}
+        
+        for class_idx in range(num_classes):
+            if class_idx not in syn_low_features_dict or syn_low_features_dict[class_idx] is None:
+                continue
+            
+            available_syn_low_features = syn_low_features_dict[class_idx]  # shape: (syn_num, low_feature_dim)
+            available_count = available_syn_low_features.shape[0]
+            
+            if class_idx not in client_classes:
+                # 缺失类别：使用全部合成低级特征
+                client_syn_low_features[class_idx] = available_syn_low_features
+                if logger:
+                    logger.info(f'Client {client_id}: Class {class_idx} (missing) - allocated all {available_count} synthetic low-level features')
+            else:
+                # 已有类别：补充到 max_samples
+                real_count = int(real_samples_per_class[class_idx].item())
+                needed = max(0, max_samples - real_count)
+                take = min(needed, available_count)
+                
+                if take > 0:
+                    # 随机采样 take 个合成低级特征
+                    indices = torch.randperm(available_count)[:take]
+                    selected_features = available_syn_low_features[indices]
+                    client_syn_low_features[class_idx] = selected_features
+                    if logger:
+                        logger.info(f'Client {client_id}: Class {class_idx} (existing) - real: {real_count}, needed: {needed}, allocated: {take} synthetic low-level features')
+                else:
+                    client_syn_low_features[class_idx] = None
+                    if logger:
+                        logger.info(f'Client {client_id}: Class {class_idx} (existing) - real: {real_count}, max: {max_samples}, no synthetic low-level features needed')
+        
+        # 创建 SyntheticLowLevelFeatureDataset
+        client_syn_low_features_filtered = {k: v for k, v in client_syn_low_features.items() if v is not None}
+        
+        if len(client_syn_low_features_filtered) > 0:
+            client_synthetic_low_datasets[client_id] = SyntheticLowLevelFeatureDataset(client_syn_low_features_filtered)
+            total_syn_low = len(client_synthetic_low_datasets[client_id])
+            if logger:
+                logger.info(f'Client {client_id}: Total synthetic low-level features allocated: {total_syn_low}')
+        else:
+            client_synthetic_low_datasets[client_id] = None
+            if logger:
+                logger.info(f'Client {client_id}: No synthetic low-level features allocated')
+    
+    return client_synthetic_low_datasets
+
+
 def FedProto_taskheter(args, train_dataset, test_dataset, user_groups, user_groups_lt, local_model_list, classes_list, summary_writer,logger,logdir):
 
     global_protos = []
@@ -734,6 +888,9 @@ def FedMPS(args, train_dataset, test_dataset, user_groups, user_groups_lt, local
     # Initialize global_stats to store the last round's statistics
     global_stats = None
     
+    # Initialize global_classifier_state_dict (will be updated after global model training)
+    global_classifier_state_dict = None
+    
     # ========== 保存数据分布元数据 (Metadata) ==========
     # 在训练开始前,收集并保存每个客户端的 pi_sample_per_class 和 classes_list
     print('[Before Training] Saving data distribution metadata...')
@@ -788,15 +945,18 @@ def FedMPS(args, train_dataset, test_dataset, user_groups, user_groups_lt, local
             # local model updating
             # 获取该客户端的合成特征数据集（如果启用）
             client_syn_dataset = client_synthetic_datasets.get(idx, None)
+            client_syn_low_dataset = client_synthetic_low_datasets.get(idx, None) if enable_synthetic_low else None
             
             local_model = LocalUpdate(args=args, dataset=train_dataset, idxs=user_groups[idx], 
-                                     synthetic_features_dataset=client_syn_dataset)
+                                     synthetic_features_dataset=client_syn_dataset,
+                                     synthetic_low_features_dataset=client_syn_low_dataset)
             # ABBL: 传递 total_rounds 参数用于计算余弦退火权重
             w, loss, acc, high_protos, low_protos, idx_acc = local_model.update_weights_fedmps(
                 args, idx, global_high_protos, global_low_protos, global_logits, 
                 model=copy.deepcopy(local_model_list[idx]), global_round=round,
                 total_rounds=args.rounds,  # ABBL: 传递总轮数用于余弦退火
-                rf_models=rf_models, global_stats=global_stats
+                rf_models=rf_models, global_stats=global_stats,
+                global_classifier_state_dict=global_classifier_state_dict
             )
             acc_list_train.append(idx_acc)
             loss_list_train.append(loss['total'])
@@ -829,7 +989,18 @@ def FedMPS(args, train_dataset, test_dataset, user_groups, user_groups_lt, local
         logger.info(f'[Round {round+1}] Collecting local statistics from all clients...')
         
         # 获取统计量计算层级（从 args 中获取，默认为 'high'）
-        stats_level = getattr(args, 'stats_level', 'high')
+        # 如果启用了合成低级特征训练，优先使用 'low' 或 'both'
+        safs_synthesis_level = getattr(args, 'safs_synthesis_level', 'high')
+        enable_synthetic_low = getattr(args, 'enable_synthetic_low_features', 0) == 1
+        
+        if enable_synthetic_low and safs_synthesis_level in ['low', 'both']:
+            # 如果启用合成低级特征训练，需要计算 low-level 统计量
+            if safs_synthesis_level == 'low':
+                stats_level = 'low'
+            else:  # 'both'
+                stats_level = 'both'
+        else:
+            stats_level = getattr(args, 'stats_level', 'high')
         
         client_responses = []
         for idx in idxs_users:
@@ -861,8 +1032,14 @@ def FedMPS(args, train_dataset, test_dataset, user_groups, user_groups_lt, local
             print(f'[Round {round+1}] Starting SAFS feature synthesis...')
             logger.info(f'[Round {round+1}] Starting SAFS feature synthesis...')
             
-            # 确定使用的层级（与统计量聚合层级一致）
-            level_to_use = stats_level if stats_level in ['high', 'low'] else 'high'
+            # 确定使用的层级（根据 safs_synthesis_level 参数）
+            if safs_synthesis_level == 'low':
+                level_to_use = 'low'
+            elif safs_synthesis_level == 'both':
+                # 如果 both，先合成高级特征（保持向后兼容）
+                level_to_use = 'high'
+            else:  # 'high' 或默认
+                level_to_use = 'high'
             
             # 获取对应层级的全局统计量和 RFF 模型
             if level_to_use == 'high':
@@ -918,17 +1095,61 @@ def FedMPS(args, train_dataset, test_dataset, user_groups, user_groups_lt, local
                 input_cov_eps=getattr(args, 'safs_input_cov_eps', 1e-5),
             )
             
-            print(f'[Round {round+1}] SAFS feature synthesis completed')
-            logger.info(f'[Round {round+1}] SAFS feature synthesis completed')
-            print(f'[Round {round+1}] Generated synthetic features for {len(class_syn_datasets)} classes')
-            logger.info(f'[Round {round+1}] Generated synthetic features for {len(class_syn_datasets)} classes')
+            print(f'[Round {round+1}] SAFS feature synthesis completed ({level_to_use}-level)')
+            logger.info(f'[Round {round+1}] SAFS feature synthesis completed ({level_to_use}-level)')
+            print(f'[Round {round+1}] Generated synthetic {level_to_use}-level features for {len(class_syn_datasets)} classes')
+            logger.info(f'[Round {round+1}] Generated synthetic {level_to_use}-level features for {len(class_syn_datasets)} classes')
+            
+            # 如果启用了合成低级特征训练，且当前合成的是低级特征
+            class_syn_low_datasets = None
+            if enable_synthetic_low and level_to_use == 'low':
+                class_syn_low_datasets = class_syn_datasets
+                class_syn_datasets = None  # 高级特征数据集设为 None
+            elif safs_synthesis_level == 'both':
+                # 如果 both，需要分别合成高级和低级特征
+                # 先合成高级特征（已完成），再合成低级特征
+                if level_to_use == 'high':
+                    # 保存高级特征数据集
+                    class_syn_datasets_high = class_syn_datasets
+                    # 合成低级特征
+                    global_stats_low = global_stats['low']
+                    rf_model_low = rf_models['low']
+                    feature_dim_low = low_feature_dim
+                    class_means_low = global_stats_low['class_means']
+                    class_covs_low = global_stats_low['class_covs']
+                    class_rf_means_low = global_stats_low['class_rf_means']
+                    
+                    aligners_low = []
+                    for c in range(args.num_classes):
+                        aligner_low = MeanCovAligner(
+                            target_mean=class_means_low[c],
+                            target_cov=class_covs_low[c],
+                            target_cov_eps=getattr(args, 'safs_target_cov_eps', 1e-5)
+                        )
+                        aligners_low.append(aligner_low)
+                    
+                    class_syn_low_datasets = feature_synthesis(
+                        feature_dim=feature_dim_low,
+                        class_num=args.num_classes,
+                        device=args.device,
+                        aligners=aligners_low,
+                        rf_model=rf_model_low,
+                        class_rf_means=class_rf_means_low,
+                        steps=getattr(args, 'safs_steps', 1000),
+                        lr=getattr(args, 'safs_lr', 0.1),
+                        syn_num_per_class=syn_nums,
+                        input_cov_eps=getattr(args, 'safs_input_cov_eps', 1e-5),
+                    )
+                    class_syn_datasets = class_syn_datasets_high
+                    print(f'[Round {round+1}] Also generated synthetic low-level features for {len(class_syn_low_datasets)} classes')
+                    logger.info(f'[Round {round+1}] Also generated synthetic low-level features for {len(class_syn_low_datasets)} classes')
             
             # ========== 为客户端分配合成特征 ==========
             # 检查是否启用客户端使用合成特征
             enable_client_syn = getattr(args, 'enable_client_synthetic_features', 1)
-            if enable_client_syn == 1:
-                print(f'[Round {round+1}] Distributing synthetic features to clients...')
-                logger.info(f'[Round {round+1}] Distributing synthetic features to clients...')
+            if enable_client_syn == 1 and class_syn_datasets is not None:
+                print(f'[Round {round+1}] Distributing synthetic high-level features to clients...')
+                logger.info(f'[Round {round+1}] Distributing synthetic high-level features to clients...')
                 
                 client_synthetic_datasets = distribute_synthetic_features_to_clients(
                     args=args,
@@ -939,19 +1160,40 @@ def FedMPS(args, train_dataset, test_dataset, user_groups, user_groups_lt, local
                     logger=logger
                 )
                 
-                print(f'[Round {round+1}] Synthetic features distributed to clients')
-                logger.info(f'[Round {round+1}] Synthetic features distributed to clients')
+                print(f'[Round {round+1}] Synthetic high-level features distributed to clients')
+                logger.info(f'[Round {round+1}] Synthetic high-level features distributed to clients')
             else:
                 client_synthetic_datasets = {idx: None for idx in range(args.num_users)}
-                print(f'[Round {round+1}] Client synthetic features disabled')
-                logger.info(f'[Round {round+1}] Client synthetic features disabled')
+                if not enable_client_syn:
+                    print(f'[Round {round+1}] Client synthetic features disabled')
+                    logger.info(f'[Round {round+1}] Client synthetic features disabled')
             
-            # 可选：保存合成特征数据集（用于后续的分类器微调）
-            # 这里可以根据需要保存到文件或传递给分类器微调阶段
-            # 例如：torch.save(class_syn_datasets, f'{logdir}/synthetic_features_round_{round+1}.pt')
+            # ========== 为客户端分配合成的低级特征 ==========
+            client_synthetic_low_datasets = {idx: None for idx in range(args.num_users)}
+            if enable_synthetic_low and class_syn_low_datasets is not None:
+                print(f'[Round {round+1}] Distributing synthetic low-level features to clients...')
+                logger.info(f'[Round {round+1}] Distributing synthetic low-level features to clients...')
+                
+                client_synthetic_low_datasets = distribute_synthetic_low_features_to_clients(
+                    args=args,
+                    class_syn_low_datasets=class_syn_low_datasets,
+                    user_groups=user_groups,
+                    classes_list=classes_list,
+                    train_dataset=train_dataset,
+                    logger=logger
+                )
+                
+                print(f'[Round {round+1}] Synthetic low-level features distributed to clients')
+                logger.info(f'[Round {round+1}] Synthetic low-level features distributed to clients')
         else:
             class_syn_datasets = None
+            class_syn_low_datasets = None
             client_synthetic_datasets = {idx: None for idx in range(args.num_users)}
+            client_synthetic_low_datasets = {idx: None for idx in range(args.num_users)}
+        
+        # 可选：保存合成特征数据集（用于后续的分类器微调）
+        # 这里可以根据需要保存到文件或传递给分类器微调阶段
+        # 例如：torch.save(class_syn_datasets, f'{logdir}/synthetic_features_round_{round+1}.pt')
         
         # ========== Global Model Training / Fine-tuning ==========
         # 根据是否启用 SAFS 选择不同的全局模型训练方式
@@ -983,6 +1225,18 @@ def FedMPS(args, train_dataset, test_dataset, user_groups, user_groups_lt, local
             train_dataloader = DataLoader(dataset, batch_size=4, shuffle=True)
             # begin training and output global logits
             global_logits = train_global_proto_model(global_model, train_dataloader)
+        
+        # ========== 从训练好的全局模型中提取分类头 ==========
+        # 注意：全局模型已经通过上面的训练过程更新，所以直接从中提取分类头即可
+        global_classifier_state_dict = None
+        use_global_classifier = getattr(args, 'use_global_classifier', 1) == 1
+        enable_synthetic_low = getattr(args, 'enable_synthetic_low_features', 0) == 1
+        if enable_synthetic_low and use_global_classifier:
+            print(f'[Round {round+1}] Extracting global classifier head from trained global model...')
+            logger.info(f'[Round {round+1}] Extracting global classifier head from trained global model...')
+            global_classifier_state_dict = extract_classifier_from_global_model(global_model, args)
+            print(f'[Round {round+1}] Global classifier head extracted')
+            logger.info(f'[Round {round+1}] Global classifier head extracted')
 
         # ABBL: 记录训练损失（包括所有损失分量）以及权重退火
         print('| ROUND: {} | Train Loss - Total: {:.5f}, L_ACE: {:.5f}, L_A-SCL: {:.5f}, L_proto_high: {:.5f}, L_proto_low: {:.5f}, L_soft: {:.5f}, SCL_Weight: {:.5f}'.format(
