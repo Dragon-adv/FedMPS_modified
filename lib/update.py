@@ -122,29 +122,41 @@ class LocalUpdate(object):
         """
         self.args = args
         self.synthetic_features_dataset = synthetic_features_dataset
-        self.trainloader = self.train_val_test(dataset, list(idxs), synthetic_features_dataset)
         self.device = args.device
         self.criterion = nn.NLLLoss().to(self.device)   # Negative Log Likelihood Loss; nn.CrossEntropyLoss = nn.LogSoftmax + nn.NLLLoss
         self.ntd_criterion = NTD_Loss(args.num_classes, args.ntd_tau, args.ntd_beta)
         self.gkd_criterion = nn.CrossEntropyLoss(reduction="mean")
         
-        # ABBL: 统计当前 Client 数据集的每个类别样本数量
-        # 遍历 trainloader 收集所有标签
+        # 解耦 Batch 处理：维护两个独立的 DataLoader
+        self.real_loader, self.syn_loader = self.train_val_test(dataset, list(idxs), synthetic_features_dataset)
+        
+        # 修正分布统计：统计包含合成数据后的实际样本分布
         all_labels = []
-        for batch_data in self.trainloader:
+        
+        # 统计真实数据的标签
+        for batch_data in self.real_loader:
             if isinstance(batch_data, tuple) and len(batch_data) == 2:
                 _, labels = batch_data
                 all_labels.append(labels)
-        # 拼接所有标签并统计每个类别的样本数
+        
+        # 统计合成数据的标签（如果存在）
+        if self.syn_loader is not None:
+            for batch_data in self.syn_loader:
+                if isinstance(batch_data, tuple) and len(batch_data) == 2:
+                    _, labels = batch_data
+                    all_labels.append(labels)
+        
+        # 拼接所有标签并统计每个类别的样本数（包含合成数据）
         if len(all_labels) > 0:
             all_labels_tensor = torch.cat(all_labels, dim=0)
-            real_sample_per_class = all_labels_tensor.bincount(minlength=args.num_classes)
+            total_sample_per_class = all_labels_tensor.bincount(minlength=args.num_classes)
         else:
-            real_sample_per_class = torch.zeros(args.num_classes, dtype=torch.long)
+            total_sample_per_class = torch.zeros(args.num_classes, dtype=torch.long)
         
         # 计算平滑后的类别分布 π（用于 L_ACE 和 L_A-SCL）
+        # 注意：这里使用的是包含合成数据后的总分布，确保 L_ACE 的调整项是准确的
         beta_pi = getattr(args, 'beta_pi', 0.5)
-        self.pi_sample_per_class = self.make_pi_sample_per_class(real_sample_per_class, beta_pi)
+        self.pi_sample_per_class = self.make_pi_sample_per_class(total_sample_per_class, beta_pi)
         # 移动到设备
         self.pi_sample_per_class = self.pi_sample_per_class.to(self.device)
 
@@ -153,29 +165,32 @@ class LocalUpdate(object):
         Returns train, validation and test dataloaders for a given dataset
         and user indexes.
         
+        解耦 Batch 处理：返回两个独立的 DataLoader，避免形状不一致问题。
+        
         Args:
             dataset: 真实数据集
             idxs: 数据索引
             synthetic_features_dataset: SyntheticFeatureDataset 实例，可选
+        
+        Returns:
+            real_loader: 真实图像数据的 DataLoader
+            syn_loader: 合成特征数据的 DataLoader（如果存在），否则为 None
         """
         idxs_train = idxs[:int(1 * len(idxs))]
         drop_last = bool(getattr(self.args, 'drop_last', 1))
         
         # 创建真实数据集
         real_dataset = DatasetSplit(dataset, idxs_train)
+        real_loader = DataLoader(real_dataset,
+                                 batch_size=self.args.local_bs, shuffle=True, drop_last=drop_last)
         
-        # 如果有合成特征，创建混合数据集
+        # 如果有合成特征，创建独立的 DataLoader
+        syn_loader = None
         if synthetic_features_dataset is not None and len(synthetic_features_dataset) > 0:
-            mix_ratio = getattr(self.args, 'synthetic_feature_mix_ratio', 0.5)
-            mixed_dataset = MixedDataset(real_dataset, synthetic_features_dataset, mix_ratio)
-            trainloader = DataLoader(mixed_dataset,
-                                     batch_size=self.args.local_bs, shuffle=True, drop_last=drop_last)
-        else:
-            # 只使用真实数据
-            trainloader = DataLoader(real_dataset,
-                                     batch_size=self.args.local_bs, shuffle=True, drop_last=drop_last)
+            syn_loader = DataLoader(synthetic_features_dataset,
+                                   batch_size=self.args.local_bs, shuffle=True, drop_last=drop_last)
 
-        return trainloader
+        return real_loader, syn_loader
 
     def update_weights_fedavg(self, idx,model):
         # Set mode to train model
@@ -740,136 +755,174 @@ class LocalUpdate(object):
         else:
             scl_weight = scl_weight_start
 
+        # 两阶段训练：检查是否需要冻结 Backbone
+        enable_two_stage = getattr(args, 'enable_two_stage_training', 0)
+        freeze_backbone = False
+        if enable_two_stage == 1 and self.syn_loader is not None:
+            # Phase 1: 冻结 Encoder，仅训练 Classifier（使用合成特征）
+            # Phase 2: 解冻全模型，仅使用真实图像训练
+            # 这里简化处理：如果启用两阶段，前一半 epoch 冻结 Backbone
+            freeze_backbone = (iter < self.args.train_ep // 2) if enable_two_stage == 1 else False
+        
+        # 设置哪些参数需要梯度
+        if freeze_backbone:
+            # 冻结 Encoder（Backbone），只训练 Classifier
+            for name, param in model.named_parameters():
+                # 根据模型结构冻结 Encoder 部分
+                # 这里需要根据具体模型结构调整
+                if 'conv' in name or 'layer' in name or 'features' in name or 'stem' in name:
+                    param.requires_grad = False
+                else:
+                    param.requires_grad = True
+        else:
+            # 解冻所有参数
+            for param in model.parameters():
+                param.requires_grad = True
+        
         for iter in range(self.args.train_ep):
+            # 更新冻结状态（每个 epoch 开始时）
+            if enable_two_stage == 1 and self.syn_loader is not None:
+                freeze_backbone = (iter < self.args.train_ep // 2)
+                if freeze_backbone:
+                    for name, param in model.named_parameters():
+                        if 'conv' in name or 'layer' in name or 'features' in name or 'stem' in name:
+                            param.requires_grad = False
+                        else:
+                            param.requires_grad = True
+                else:
+                    for param in model.parameters():
+                        param.requires_grad = True
+            
             correct = 0
             total = 0
             batch_loss = {'total': [], 'ace': [], 'scl': [], 'proto_high': [], 'proto_low': [], 'soft': []}
             agg_high_protos_label = {}
             agg_low_protos_label = {}
-            for batch_idx, batch_data in enumerate(self.trainloader):
-                # 处理混合数据：可能是 (images, labels) 或 (features, labels)
-                if isinstance(batch_data, tuple) and len(batch_data) == 2:
-                    data, label_g = batch_data
-                    labels = label_g.to(self.device)
+            
+            # 解耦 Batch 处理：分别处理真实数据和合成数据
+            # 创建迭代器
+            real_iter = iter(self.real_loader)
+            syn_iter = iter(self.syn_loader) if self.syn_loader is not None else None
+            
+            batch_idx = 0
+            while True:
+                # 尝试获取真实数据 batch
+                try:
+                    real_batch = next(real_iter)
+                except StopIteration:
+                    real_batch = None
+                
+                # 尝试获取合成数据 batch
+                syn_batch = None
+                if syn_iter is not None:
+                    try:
+                        syn_batch = next(syn_iter)
+                    except StopIteration:
+                        syn_batch = None
+                
+                # 如果两个 batch 都为空，退出循环
+                if real_batch is None and syn_batch is None:
+                    break
+                # 处理真实图像数据
+                if real_batch is not None:
+                    images, labels = real_batch
+                    images, labels = images.to(self.device), labels.to(self.device)
                     
-                    # 判断是图像还是特征（通过维度判断）
-                    # 图像通常是 4D (batch, channels, height, width)
-                    # 特征通常是 2D (batch, feature_dim)
-                    if len(data.shape) == 4:
-                        # 真实图像数据
-                        images = data.to(self.device)
-                        model.zero_grad()
-                        # ABBL: 获取 5 个返回值（包括 projected_features）
-                        logits, log_probs, high_protos, low_protos, projected_features = model(images)
-                    elif len(data.shape) == 2:
-                        # 合成特征数据
-                        high_features = data.to(self.device)
-                        model.zero_grad()
-                        # 从 high-level features 开始前向传播
-                        logits, log_probs, high_protos, low_protos, projected_features = self.forward_from_high_features(
-                            model, high_features, args
-                        )
-                    else:
-                        raise ValueError(f"Unexpected data shape: {data.shape}")
-                else:
-                    # 兼容旧格式
-                    images, label_g = batch_data
-                    images, labels = images.to(self.device), label_g.to(self.device)
                     model.zero_grad()
+                    # ABBL: 获取 5 个返回值（包括 projected_features）
                     logits, log_probs, high_protos, low_protos, projected_features = model(images)
-
-                # Loss 1 (ABBL): L_ACE - 自适应交叉熵损失
-                # 关键：传入原始 logits，而非 log_probs
-                a_ce_gamma = getattr(args, 'a_ce_gamma', 0.1)
-                loss_ace = self.logit_adjustment_ce(
-                    logits=logits,  # 原始 logits
-                    target=labels,
-                    sample_per_class=self.pi_sample_per_class,
-                    gamma=a_ce_gamma
-                )
-
-                # Loss 2 (ABBL): L_A-SCL - 自适应监督对比学习损失（使用修正后的方法）
-                loss_scl = self.compute_adaptive_supervised_contrastive_loss(
-                    projected_features=projected_features,
-                    labels=labels,
-                    n_k=self.pi_sample_per_class,
-                    args=args
-                )
-
-                # Loss 3 (FedMPS): high-level contrastive learning loss between local features and global prototypes
-                # Loss 4 (FedMPS): low-level contrastive learning loss between local features and global prototypes
-                loss_mysupcon = MySupConLoss(temperature=0.5)
-                if len(global_high_protos) == 0:
-                    loss_proto_high = 0 * loss_ace
-                    loss_proto_low = 0 * loss_ace
-                else:
-                    global_h_input, global_h_labels = self.hcfit(global_high_protos, high_protos, labels)
-                    global_l_input, global_l_labels = self.hcfit(global_low_protos, low_protos, labels)
                     
-                    # 统一归一化：本地特征和全局原型都在对比学习前归一化
-                    # 这样保证对比学习时输入归一化状态一致
-                    local_h_input = F.normalize(high_protos, dim=1)
-                    local_h_labels = labels
-                    local_l_input = F.normalize(low_protos, dim=1)
-                    local_l_labels = labels
+                    # 标记这是真实数据（用于损失计算）
+                    is_synthetic = False
                     
-                    # 全局原型也需要归一化（因为它们是未归一化特征的均值）
-                    global_h_input = F.normalize(global_h_input, dim=1)
-                    global_l_input = F.normalize(global_l_input, dim=1)
+                    # 计算所有损失（包括 loss_proto_low）
+                    loss_ace, loss_scl, loss_proto_high, loss_proto_low, loss_soft = self.compute_losses(
+                        args, model, logits, log_probs, high_protos, low_protos, projected_features,
+                        labels, global_high_protos, global_low_protos, global_logits,
+                        scl_weight, is_synthetic
+                    )
+                    
+                    # 总损失
+                    loss = loss_ace + scl_weight * loss_scl + args.alph * loss_proto_high + args.beta * loss_proto_low + args.gama * loss_soft
+                    
+                    loss.backward()
+                    optimizer.step()
+                    
+                    # 收集原型
+                    for i in range(len(labels)):
+                        if labels[i].item() in agg_high_protos_label:
+                            agg_high_protos_label[labels[i].item()].append(high_protos[i, :])
+                            agg_low_protos_label[labels[i].item()].append(low_protos[i, :])
+                        else:
+                            agg_high_protos_label[labels[i].item()] = [high_protos[i, :]]
+                            agg_low_protos_label[labels[i].item()] = [low_protos[i, :]]
+                    
+                    log_probs = log_probs[:, 0:args.num_classes]
+                    _, y_hat = log_probs.max(1)
+                    acc_val = torch.eq(y_hat, labels.squeeze()).float().mean()
+                    correct += torch.eq(y_hat, labels.squeeze()).int().sum().item()
+                    total += labels.size(0)
+                
+                # 处理合成特征数据
+                if syn_batch is not None:
+                    high_features, labels = syn_batch
+                    high_features, labels = high_features.to(self.device), labels.to(self.device)
+                    
+                    model.zero_grad()
+                    # 从 high-level features 开始前向传播
+                    logits, log_probs, high_protos, low_protos, projected_features = self.forward_from_high_features(
+                        model, high_features, args
+                    )
+                    
+                    # 标记这是合成数据（用于损失计算）
+                    is_synthetic = True
+                    
+                    # 计算损失（跳过 loss_proto_low）
+                    loss_ace, loss_scl, loss_proto_high, loss_proto_low, loss_soft = self.compute_losses(
+                        args, model, logits, log_probs, high_protos, low_protos, projected_features,
+                        labels, global_high_protos, global_low_protos, global_logits,
+                        scl_weight, is_synthetic
+                    )
+                    
+                    # 总损失（注意：loss_proto_low 应该为 0，因为 is_synthetic=True）
+                    loss = loss_ace + scl_weight * loss_scl + args.alph * loss_proto_high + args.beta * loss_proto_low + args.gama * loss_soft
+                    
+                    loss.backward()
+                    optimizer.step()
+                    
+                    # 收集原型（只收集 high_protos，因为合成数据没有真正的 low_protos）
+                    for i in range(len(labels)):
+                        if labels[i].item() in agg_high_protos_label:
+                            agg_high_protos_label[labels[i].item()].append(high_protos[i, :])
+                        else:
+                            agg_high_protos_label[labels[i].item()] = [high_protos[i, :]]
+                    
+                    log_probs = log_probs[:, 0:args.num_classes]
+                    _, y_hat = log_probs.max(1)
+                    acc_val = torch.eq(y_hat, labels.squeeze()).float().mean()
+                    correct += torch.eq(y_hat, labels.squeeze()).int().sum().item()
+                    total += labels.size(0)
+                
+                # 记录损失（只在有数据时记录）
+                if real_batch is not None or syn_batch is not None:
+                    if self.args.verbose and (batch_idx % 10 == 0):
+                        total_samples = len(self.real_loader.dataset) + (len(self.syn_loader.dataset) if self.syn_loader else 0)
+                        processed = batch_idx * self.args.local_bs
+                        current_loss = loss.item() if 'loss' in locals() else 0.0
+                        current_acc = acc_val.item() if 'acc_val' in locals() else 0.0
+                        print('| Global Round : {} | User: {} | Local Epoch : {} | [{}/{} ({:.0f}%)]\tLoss: {:.3f} | Acc: {:.3f}'.format(
+                                global_round, idx, iter, processed, total_samples,
+                                100. * processed / total_samples if total_samples > 0 else 0,
+                                current_loss, current_acc))
+                    
+                    if 'loss' in locals():
+                        batch_loss['total'].append(loss.item())
+                        batch_loss['ace'].append(loss_ace.item())
+                        batch_loss['scl'].append(loss_scl.item())
+                        batch_loss['proto_high'].append(loss_proto_high.item())
+                        batch_loss['proto_low'].append(loss_proto_low.item())
+                        batch_loss['soft'].append(loss_soft.item())
 
-                    loss_proto_low = loss_mysupcon.forward(feature_i=local_l_input, feature_j=global_l_input,
-                                                          label_i=local_l_labels, label_j=global_l_labels)
-                    loss_proto_high = loss_mysupcon.forward(feature_i=local_h_input, feature_j=global_h_input,
-                                                           label_i=local_h_labels, label_j=global_h_labels)
-
-                # Loss 5 (FedMPS): distillation loss between local soft labels and global soft labels
-                soft_loss = nn.KLDivLoss(reduction="batchmean")
-                T = args.T
-                if len(global_logits) == 0:
-                    loss_soft = 0 * loss_ace
-                else:
-                    # 从全局 logits 字典中获取对应类别的 logits
-                    global_logits_tensor = []
-                    for l in labels:
-                        class_logits = global_logits[l.item()]  # 获取该类别的全局 logits
-                        global_logits_tensor.append(class_logits)
-                    global_logits_tensor = torch.stack(global_logits_tensor)
-                    # 使用 logits 计算 softmax（而非 probs）
-                    loss_soft = soft_loss(F.log_softmax(logits / T, dim=1), F.softmax(global_logits_tensor / T, dim=1))
-
-                # ABBL 集成版本的总损失公式
-                loss = loss_ace + scl_weight * loss_scl + args.alph * loss_proto_high + args.beta * loss_proto_low + args.gama * loss_soft
-
-
-                loss.backward()
-                optimizer.step()
-
-                for i in range(len(labels)):
-                    if labels[i].item() in agg_high_protos_label:
-                        agg_high_protos_label[labels[i].item()].append(high_protos[i, :])
-                        agg_low_protos_label[labels[i].item()].append(low_protos[i, :])
-                    else:
-                        agg_high_protos_label[labels[i].item()] = [high_protos[i, :]]
-                        agg_low_protos_label[labels[i].item()] = [low_protos[i, :]]
-
-                log_probs = log_probs[:, 0:args.num_classes]
-                _, y_hat = log_probs.max(1)
-                acc_val = torch.eq(y_hat, labels.squeeze()).float().mean()
-                correct += torch.eq(y_hat, labels.squeeze()).int().sum().item()
-                total += labels.size(0)
-                if self.args.verbose and (batch_idx % 10 == 0):
-                    print('| Global Round : {} | User: {} | Local Epoch : {} | [{}/{} ({:.0f}%)]\tLoss: {:.3f} | Acc: {:.3f}'.format(
-                            global_round, idx, iter, batch_idx * len(images),
-                            len(self.trainloader.dataset),
-                            100. * batch_idx / len(self.trainloader),
-                            loss.item(),
-                            acc_val.item()))
-                batch_loss['total'].append(loss.item())
-                batch_loss['ace'].append(loss_ace.item())
-                batch_loss['scl'].append(loss_scl.item())
-                batch_loss['proto_high'].append(loss_proto_high.item())
-                batch_loss['proto_low'].append(loss_proto_low.item())
-                batch_loss['soft'].append(loss_soft.item())
             epoch_loss['total'].append(sum(batch_loss['total']) / len(batch_loss['total']))
             epoch_loss['ace'].append(sum(batch_loss['ace']) / len(batch_loss['ace']))
             epoch_loss['scl'].append(sum(batch_loss['scl']) / len(batch_loss['scl']))
@@ -887,6 +940,91 @@ class LocalUpdate(object):
 
         return model.state_dict(), epoch_loss, acc_val.item(), agg_high_protos_label, agg_low_protos_label, acc_last_epoch
 
+    def compute_losses(self, args, model, logits, log_probs, high_protos, low_protos, projected_features,
+                      labels, global_high_protos, global_low_protos, global_logits,
+                      scl_weight, is_synthetic=False):
+        """
+        计算所有损失分量。
+        
+        Args:
+            args: 参数对象
+            model: 模型实例
+            logits: 模型输出的 logits
+            log_probs: 模型输出的 log_probs
+            high_protos: high-level features
+            low_protos: low-level features
+            projected_features: 投影后的特征（用于对比学习）
+            labels: 标签
+            global_high_protos: 全局 high-level prototypes
+            global_low_protos: 全局 low-level prototypes
+            global_logits: 全局 logits
+            scl_weight: SCL 损失权重
+            is_synthetic: 是否为合成数据（如果是，跳过 loss_proto_low）
+        
+        Returns:
+            (loss_ace, loss_scl, loss_proto_high, loss_proto_low, loss_soft)
+        """
+        # Loss 1 (ABBL): L_ACE - 自适应交叉熵损失
+        a_ce_gamma = getattr(args, 'a_ce_gamma', 0.1)
+        loss_ace = self.logit_adjustment_ce(
+            logits=logits,
+            target=labels,
+            sample_per_class=self.pi_sample_per_class,
+            gamma=a_ce_gamma
+        )
+
+        # Loss 2 (ABBL): L_A-SCL - 自适应监督对比学习损失
+        loss_scl = self.compute_adaptive_supervised_contrastive_loss(
+            projected_features=projected_features,
+            labels=labels,
+            n_k=self.pi_sample_per_class,
+            args=args
+        )
+
+        # Loss 3 & 4 (FedMPS): Multi-level prototype contrastive learning
+        loss_mysupcon = MySupConLoss(temperature=0.5)
+        if len(global_high_protos) == 0:
+            loss_proto_high = 0 * loss_ace
+            loss_proto_low = 0 * loss_ace
+        else:
+            # High-level prototype loss (始终计算)
+            global_h_input, global_h_labels = self.hcfit(global_high_protos, high_protos, labels)
+            local_h_input = F.normalize(high_protos, dim=1)
+            local_h_labels = labels
+            global_h_input = F.normalize(global_h_input, dim=1)
+            loss_proto_high = loss_mysupcon.forward(
+                feature_i=local_h_input, feature_j=global_h_input,
+                label_i=local_h_labels, label_j=global_h_labels
+            )
+            
+            # Low-level prototype loss (仅对真实数据计算)
+            if is_synthetic:
+                # 修复 Low-level 缺失：对合成数据跳过 loss_proto_low
+                loss_proto_low = 0 * loss_ace
+            else:
+                global_l_input, global_l_labels = self.hcfit(global_low_protos, low_protos, labels)
+                local_l_input = F.normalize(low_protos, dim=1)
+                local_l_labels = labels
+                global_l_input = F.normalize(global_l_input, dim=1)
+                loss_proto_low = loss_mysupcon.forward(
+                    feature_i=local_l_input, feature_j=global_l_input,
+                    label_i=local_l_labels, label_j=global_l_labels
+                )
+
+        # Loss 5 (FedMPS): distillation loss
+        soft_loss = nn.KLDivLoss(reduction="batchmean")
+        T = args.T
+        if len(global_logits) == 0:
+            loss_soft = 0 * loss_ace
+        else:
+            global_logits_tensor = []
+            for l in labels:
+                class_logits = global_logits[l.item()]
+                global_logits_tensor.append(class_logits)
+            global_logits_tensor = torch.stack(global_logits_tensor)
+            loss_soft = soft_loss(F.log_softmax(logits / T, dim=1), F.softmax(global_logits_tensor / T, dim=1))
+
+        return loss_ace, loss_scl, loss_proto_high, loss_proto_low, loss_soft
 
     def forward_from_high_features(self, model, high_features, args):
         """

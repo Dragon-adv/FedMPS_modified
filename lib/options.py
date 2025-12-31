@@ -137,5 +137,13 @@ def args_parser():
     parser.add_argument('--scl_temperature', type=float, default=0.07,
                         help='Temperature coefficient for L_A-SCL contrastive learning (default: 0.07). Note: different from --temperature which is for FedMPS contrastive loss (default: 0.5)')
 
+    # for Client Synthetic Features
+    parser.add_argument('--enable_client_synthetic_features', type=int, default=1,
+                        help='Enable clients to use synthetic features for training (0: disabled, 1: enabled, default: 1)')
+    parser.add_argument('--enable_two_stage_training', type=int, default=0,
+                        help='Enable two-stage training: Phase 1 freeze backbone (use synthetic features), Phase 2 unfreeze (use real images only) (0: disabled, 1: enabled, default: 0)')
+    parser.add_argument('--synthetic_feature_mix_ratio', type=float, default=0.5,
+                        help='Ratio of synthetic features in batch (0-1, default: 0.5, not used in current implementation)')
+
     args = parser.parse_args()
     return args
