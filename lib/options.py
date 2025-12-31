@@ -145,5 +145,11 @@ def args_parser():
     parser.add_argument('--synthetic_feature_mix_ratio', type=float, default=0.5,
                         help='Ratio of synthetic features in batch (0-1, default: 0.5, not used in current implementation)')
 
+    # for Loss Function Selection (CE vs A-CE, SCL vs A-SCL)
+    parser.add_argument('--use_adaptive_ce', type=int, default=0,
+                        help='Use adaptive cross-entropy loss (L_ACE) instead of standard CE (0: use standard CE, 1: use L_ACE, default: 0)')
+    parser.add_argument('--use_adaptive_scl', type=int, default=0,
+                        help='Use adaptive supervised contrastive loss (L_A-SCL) instead of standard SCL (0: use standard SCL, 1: use L_A-SCL, default: 0)')
+
     args = parser.parse_args()
     return args

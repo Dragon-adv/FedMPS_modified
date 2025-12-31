@@ -39,7 +39,11 @@ def make_pi_sample_per_class(real_sample_per_class: torch.Tensor, beta_pi: float
         用于计算 L_ACE 和 L_A-SCL 损失时，确保即使某些类别在本地数据中缺失，
         也能正确计算损失函数，避免梯度消失问题。
     """
-    class_size_min = real_sample_per_class[real_sample_per_class > 0].min()
+    pos_samples = real_sample_per_class[real_sample_per_class > 0]
+    if pos_samples.numel() == 0:
+        # 如果没有任何样本，返回全1分布的平滑结果
+        return torch.ones_like(real_sample_per_class) * beta_pi
+    class_size_min = pos_samples.min()
     pi_sample_per_class = real_sample_per_class.clone()
     pi_sample_per_class[pi_sample_per_class == 0] = class_size_min * beta_pi
     return pi_sample_per_class

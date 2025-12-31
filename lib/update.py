@@ -938,6 +938,9 @@ class LocalUpdate(object):
                         batch_loss['proto_high'].append(loss_proto_high.item())
                         batch_loss['proto_low'].append(loss_proto_low.item())
                         batch_loss['soft'].append(loss_soft.item())
+                    
+                    # 递增 batch_idx
+                    batch_idx += 1
 
             epoch_loss['total'].append(sum(batch_loss['total']) / len(batch_loss['total']))
             epoch_loss['ace'].append(sum(batch_loss['ace']) / len(batch_loss['ace']))
@@ -982,28 +985,46 @@ class LocalUpdate(object):
         Returns:
             (loss_ace, loss_scl, loss_proto_high, loss_proto_low, loss_soft)
         """
-        # Loss 1 (ABBL): L_ACE - 自适应交叉熵损失（始终计算，用于训练 classifier）
-        a_ce_gamma = getattr(args, 'a_ce_gamma', 0.1)
-        loss_ace = self.logit_adjustment_ce(
-            logits=logits,
-            target=labels,
-            sample_per_class=self.pi_sample_per_class,
-            gamma=a_ce_gamma
-        )
+        import torch.nn.functional as F
+        
+        # Loss 1: 选择使用标准 CE 或自适应 CE (L_ACE)
+        use_adaptive_ce = getattr(args, 'use_adaptive_ce', 0)
+        if use_adaptive_ce == 1:
+            # 使用自适应交叉熵损失 (L_ACE)
+            a_ce_gamma = getattr(args, 'a_ce_gamma', 0.1)
+            loss_ace = self.logit_adjustment_ce(
+                logits=logits,
+                target=labels,
+                sample_per_class=self.pi_sample_per_class,
+                gamma=a_ce_gamma
+            )
+        else:
+            # 使用标准交叉熵损失
+            loss_ace = F.cross_entropy(logits, labels, reduction='mean')
 
-        # Loss 2 (ABBL): L_A-SCL - 自适应监督对比学习损失
+        # Loss 2: 选择使用标准 SCL 或自适应 SCL (L_A-SCL)
         # 合成特征不经过 encoder，projector 用于训练 encoder，所以应该关闭
         if is_synthetic:
             # 合成特征与 encoder 无关，关闭对比学习损失
             loss_scl = 0 * loss_ace
         else:
             # 真实数据：计算对比学习损失，用于训练 encoder 学习更好的特征表示
-            loss_scl = self.compute_adaptive_supervised_contrastive_loss(
-                projected_features=projected_features,
-                labels=labels,
-                n_k=self.pi_sample_per_class,
-                args=args
-            )
+            use_adaptive_scl = getattr(args, 'use_adaptive_scl', 0)
+            if use_adaptive_scl == 1:
+                # 使用自适应监督对比学习损失 (L_A-SCL)
+                loss_scl = self.compute_adaptive_supervised_contrastive_loss(
+                    projected_features=projected_features,
+                    labels=labels,
+                    n_k=self.pi_sample_per_class,
+                    args=args
+                )
+            else:
+                # 使用标准监督对比学习损失 (SCL)
+                loss_scl = self.compute_standard_supervised_contrastive_loss(
+                    projected_features=projected_features,
+                    labels=labels,
+                    args=args
+                )
 
         # Loss 3 & 4 (FedMPS): Multi-level prototype contrastive learning
         loss_mysupcon = MySupConLoss(temperature=0.5)
@@ -1324,6 +1345,57 @@ class LocalUpdate(object):
         mean_log_prob_pos = (positive_mask * log_prob).sum(dim=1) / mask_sum
         
         # 9. 返回最终的监督对比学习损失（取负号并求平均）
+        loss = -mean_log_prob_pos.mean()
+        return loss
+
+    def compute_standard_supervised_contrastive_loss(self, projected_features, labels, args):
+        """
+        实现标准的监督对比学习损失函数（SCL），不包含自适应调整。
+        
+        参数:
+            projected_features: torch.Tensor, shape (batch_size, feature_dim)
+                投影后的特征向量（已在模型 forward 中归一化），通常来自 projector 的输出。
+            labels: torch.Tensor, shape (batch_size,)
+                样本对应的标签，每个元素是类别索引。
+            args: 参数对象
+                包含 scl_temperature 等超参数。
+        
+        返回:
+            loss: torch.Tensor
+                计算得到的标准 SCL 损失值（标量）。
+        """
+        import torch
+        import torch.nn.functional as F
+        
+        # 获取温度参数
+        temperature = getattr(args, 'scl_temperature', 0.07)
+        
+        # 1. projected_features 已经在模型中被归一化，直接使用
+        z = projected_features  # shape: (batch_size, feature_dim)
+        
+        # 2. 计算相似度矩阵 (z_i · z_j / temperature)
+        similarity_matrix = (z @ z.T) / temperature  # shape: (batch_size, batch_size)
+        
+        # 3. 获取正样本对掩码矩阵（相同标签的位置为 1，排除自身）
+        labels_equal = labels.unsqueeze(0) == labels.unsqueeze(1)  # shape: (batch_size, batch_size)
+        positive_mask = labels_equal.float() * (1 - torch.eye(z.shape[0], device=z.device))
+        
+        # 4. 数值稳定性处理：减去最大值以防止数值溢出
+        logits_max = torch.max(similarity_matrix, dim=1, keepdim=True).values
+        logits = similarity_matrix - logits_max.detach()
+        
+        # 5. 排除自比较（对角线元素），计算 softmax 分母
+        eye_mask = 1 - torch.eye(z.shape[0], device=z.device)  # 排除对角线
+        exp_logits = torch.exp(logits) * eye_mask
+        log_prob = logits - torch.log(exp_logits.sum(dim=1, keepdim=True) + 1e-12)
+        
+        # 6. 计算每个样本的正样本对平均对数概率
+        mask_sum = positive_mask.sum(dim=1)  # 每个样本的正样本数量
+        # 处理没有正样本的情况（避免除零）
+        mask_sum = torch.clamp(mask_sum, min=1.0)
+        mean_log_prob_pos = (positive_mask * log_prob).sum(dim=1) / mask_sum
+        
+        # 7. 返回最终的监督对比学习损失（取负号并求平均）
         loss = -mean_log_prob_pos.mean()
         return loss
 
