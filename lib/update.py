@@ -3,6 +3,7 @@
 # Python version: 3.6
 
 import math
+import numpy as np
 from torch.utils.data import DataLoader, Dataset, TensorDataset
 from lib.conloss import *
 from lib.utils import *
@@ -130,25 +131,61 @@ class LocalUpdate(object):
         # 解耦 Batch 处理：维护两个独立的 DataLoader
         self.real_loader, self.syn_loader = self.train_val_test(dataset, list(idxs), synthetic_features_dataset)
         
-        # 修正分布统计：统计包含合成数据后的实际样本分布
+        # 为了向后兼容，添加 trainloader 属性（指向 real_loader）
+        self.trainloader = self.real_loader
+        
+        # 修正分布统计：直接从数据集统计标签，避免耗尽 DataLoader 迭代器
         all_labels = []
         
-        # 统计真实数据的标签
-        for batch_data in self.real_loader:
-            if isinstance(batch_data, tuple) and len(batch_data) == 2:
-                _, labels = batch_data
-                all_labels.append(labels)
+        # 统计真实数据的标签（直接从原始数据集提取）
+        idxs_train = list(idxs)[:int(1 * len(idxs))]
+        for idx in idxs_train:
+            try:
+                _, label = dataset[int(idx)]
+                # 统一转换为整数标量
+                if isinstance(label, torch.Tensor):
+                    if label.numel() == 1:
+                        label_val = int(label.item())
+                    else:
+                        # 如果是多维张量，取第一个元素
+                        label_val = int(label.flatten()[0].item())
+                elif isinstance(label, (int, np.integer)):
+                    label_val = int(label)
+                elif hasattr(label, '__int__'):
+                    label_val = int(label)
+                else:
+                    # 尝试转换为 numpy 再转 int
+                    label_val = int(np.asarray(label).item())
+                all_labels.append(label_val)
+            except Exception as e:
+                # 如果提取失败，跳过这个样本
+                continue
         
         # 统计合成数据的标签（如果存在）
-        if self.syn_loader is not None:
-            for batch_data in self.syn_loader:
-                if isinstance(batch_data, tuple) and len(batch_data) == 2:
-                    _, labels = batch_data
-                    all_labels.append(labels)
+        if synthetic_features_dataset is not None and len(synthetic_features_dataset) > 0:
+            for i in range(len(synthetic_features_dataset)):
+                try:
+                    _, label = synthetic_features_dataset[i]
+                    # 统一转换为整数标量
+                    if isinstance(label, torch.Tensor):
+                        if label.numel() == 1:
+                            label_val = int(label.item())
+                        else:
+                            label_val = int(label.flatten()[0].item())
+                    elif isinstance(label, (int, np.integer)):
+                        label_val = int(label)
+                    elif hasattr(label, '__int__'):
+                        label_val = int(label)
+                    else:
+                        label_val = int(np.asarray(label).item())
+                    all_labels.append(label_val)
+                except Exception as e:
+                    continue
         
         # 拼接所有标签并统计每个类别的样本数（包含合成数据）
         if len(all_labels) > 0:
-            all_labels_tensor = torch.cat(all_labels, dim=0)
+            # 转换为张量
+            all_labels_tensor = torch.tensor(all_labels, dtype=torch.long)
             total_sample_per_class = all_labels_tensor.bincount(minlength=args.num_classes)
         else:
             total_sample_per_class = torch.zeros(args.num_classes, dtype=torch.long)
@@ -204,7 +241,7 @@ class LocalUpdate(object):
             optimizer = torch.optim.Adam(model.parameters(), lr=self.args.lr,
                                          weight_decay=1e-4)
 
-        for iter in range(self.args.train_ep):
+        for epoch in range(self.args.train_ep):
             correct=0
             total=0
             batch_loss = []
@@ -225,7 +262,7 @@ class LocalUpdate(object):
                 batch_loss.append(loss.item())
             epoch_loss=sum(batch_loss)/len(batch_loss)
             train_acc = correct / total
-            print(' User: %d Epoch: %d  Loss: %f ||  train_acc: %f ' % ( idx, iter, epoch_loss, train_acc))
+            print(' User: %d Epoch: %d  Loss: %f ||  train_acc: %f ' % ( idx, epoch, epoch_loss, train_acc))
 
         return model.state_dict()
 
@@ -246,7 +283,7 @@ class LocalUpdate(object):
             optimizer = torch.optim.Adam(model.parameters(), lr=self.args.lr,
                                          weight_decay=1e-4)
 
-        for iter in range(self.args.train_ep):
+        for epoch in range(self.args.train_ep):
             correct = 0
             total = 0
             batch_loss = []
@@ -274,7 +311,7 @@ class LocalUpdate(object):
             epoch_loss.append(sum(batch_loss) / len(batch_loss))
             acc_last_epoch = correct / total
             print(' User: %d Epoch: %d  Loss: %f ||  train_acc: %f ' % (
-            idx, iter, sum(batch_loss) / len(batch_loss), acc_last_epoch))
+            idx, epoch, sum(batch_loss) / len(batch_loss), acc_last_epoch))
         epoch_loss = sum(epoch_loss) / len(epoch_loss)
 
         return model.state_dict(), epoch_loss, acc_val.item(), acc_last_epoch
@@ -298,7 +335,7 @@ class LocalUpdate(object):
                                          weight_decay=1e-4)
         cos = torch.nn.CosineSimilarity(dim=-1)
         criterion = nn.CrossEntropyLoss().to(args.device)
-        for iter in range(self.args.train_ep):
+        for epoch in range(self.args.train_ep):
             correct=0
             total=0
             batch_loss = []
@@ -337,7 +374,7 @@ class LocalUpdate(object):
                 total +=labels.size(0)
                 if self.args.verbose and (batch_idx % 10 == 0):
                     print('| Global Round : {} | User: {} | Local Epoch : {} | [{}/{} ({:.0f}%)]\tLoss: {:.3f} | Acc: {:.3f}'.format(
-                        global_round, idx, iter, batch_idx * len(images),
+                        global_round, idx, epoch, batch_idx * len(images),
                         len(self.trainloader.dataset),
                         100. * batch_idx / len(self.trainloader),
                         loss.item(),
@@ -369,7 +406,7 @@ class LocalUpdate(object):
         elif self.args.optimizer == 'adam':
             optimizer = torch.optim.Adam(model.parameters(), lr=self.args.lr, weight_decay=1e-4)
 
-        for iter in range(self.args.train_ep):
+        for epoch in range(self.args.train_ep):
             correct = 0
             total = 0
             batch_loss = []
@@ -394,7 +431,7 @@ class LocalUpdate(object):
             epoch_loss = sum(batch_loss) / len(batch_loss)
             train_acc = correct / total
 
-            print(' User: %d Epoch: %d  Loss: %f ||  train_acc: %f ' % (idx, iter, epoch_loss, train_acc))
+            print(' User: %d Epoch: %d  Loss: %f ||  train_acc: %f ' % (idx, epoch, epoch_loss, train_acc))
 
         return model.state_dict()
 
@@ -412,7 +449,7 @@ class LocalUpdate(object):
         elif self.args.optimizer == 'adam':
             optimizer = torch.optim.Adam(model.parameters(), lr=self.args.lr, weight_decay=1e-4)
 
-        for iter in range(self.args.train_ep):
+        for epoch in range(self.args.train_ep):
             correct = 0
             total = 0
             batch_loss = []
@@ -450,7 +487,7 @@ class LocalUpdate(object):
             epoch_loss.append(sum(batch_loss) / len(batch_loss))
             acc_last_epoch = correct / total
             print(' User: %d Epoch: %d  Loss: %f ||  train_acc: %f ' % (
-            idx, iter, sum(batch_loss) / len(batch_loss), acc_last_epoch))
+            idx, epoch, sum(batch_loss) / len(batch_loss), acc_last_epoch))
         epoch_loss = sum(epoch_loss) / len(epoch_loss)
 
         return model.state_dict(), epoch_loss, acc_val.item(), acc_last_epoch
@@ -488,7 +525,7 @@ class LocalUpdate(object):
         else:
             alpha = 1
 
-        for iter in range(self.args.train_ep):
+        for epoch in range(self.args.train_ep):
             correct = 0
             total = 0
             batch_loss = {'total': [], '1': [], '2': [], '3': []}
@@ -536,7 +573,7 @@ class LocalUpdate(object):
                 if self.args.verbose and (batch_idx % 10 == 0):
                     print(
                         '| Global Round : {} | User: {} | Local Epoch : {} | [{}/{} ({:.0f}%)]\tLoss: {:.3f} | Acc: {:.3f}'.format(
-                            global_round, idx, iter, batch_idx * len(images),
+                            global_round, idx, epoch, batch_idx * len(images),
                             len(self.trainloader.dataset),
                                                      100. * batch_idx / len(self.trainloader),
                             loss.item(),
@@ -556,7 +593,7 @@ class LocalUpdate(object):
         return model.state_dict(), epoch_loss, acc_val.item(), agg_protos_label, acc_last_epoch
 
 
-    def update_weights_fedproto(self, args, idx, global_protos,model, global_round=round):
+    def update_weights_fedproto(self, args, idx, global_protos,model, global_round=0):
         '''
         Based on https://github.com/yuetan031/FedProto
         '''
@@ -571,7 +608,7 @@ class LocalUpdate(object):
         elif self.args.optimizer == 'adam':
             optimizer = torch.optim.Adam(model.parameters(), lr=self.args.lr,weight_decay=1e-4)
 
-        for iter in range(self.args.train_ep):
+        for epoch in range(self.args.train_ep):
             correct = 0
             total = 0
             batch_loss = {'total':[],'1':[], '2':[], '3':[]}
@@ -692,7 +729,7 @@ class LocalUpdate(object):
         else:
             return torch.stack(mmd_losses).mean()
 
-    def update_weights_fedmps(self, args, idx, global_high_protos, global_low_protos, global_logits, model, global_round=round, total_rounds=None, rf_models=None, global_stats=None):
+    def update_weights_fedmps(self, args, idx, global_high_protos, global_low_protos, global_logits, model, global_round=0, total_rounds=None, rf_models=None, global_stats=None):
         """
                 执行 FedMPS 算法的本地更新过程（集成 ABBL）。
 
@@ -757,32 +794,11 @@ class LocalUpdate(object):
 
         # 两阶段训练：检查是否需要冻结 Backbone
         enable_two_stage = getattr(args, 'enable_two_stage_training', 0)
-        freeze_backbone = False
-        if enable_two_stage == 1 and self.syn_loader is not None:
-            # Phase 1: 冻结 Encoder，仅训练 Classifier（使用合成特征）
-            # Phase 2: 解冻全模型，仅使用真实图像训练
-            # 这里简化处理：如果启用两阶段，前一半 epoch 冻结 Backbone
-            freeze_backbone = (iter < self.args.train_ep // 2) if enable_two_stage == 1 else False
         
-        # 设置哪些参数需要梯度
-        if freeze_backbone:
-            # 冻结 Encoder（Backbone），只训练 Classifier
-            for name, param in model.named_parameters():
-                # 根据模型结构冻结 Encoder 部分
-                # 这里需要根据具体模型结构调整
-                if 'conv' in name or 'layer' in name or 'features' in name or 'stem' in name:
-                    param.requires_grad = False
-                else:
-                    param.requires_grad = True
-        else:
-            # 解冻所有参数
-            for param in model.parameters():
-                param.requires_grad = True
-        
-        for iter in range(self.args.train_ep):
+        for epoch in range(self.args.train_ep):
             # 更新冻结状态（每个 epoch 开始时）
             if enable_two_stage == 1 and self.syn_loader is not None:
-                freeze_backbone = (iter < self.args.train_ep // 2)
+                freeze_backbone = (epoch < self.args.train_ep // 2)
                 if freeze_backbone:
                     for name, param in model.named_parameters():
                         if 'conv' in name or 'layer' in name or 'features' in name or 'stem' in name:
@@ -911,7 +927,7 @@ class LocalUpdate(object):
                         current_loss = loss.item() if 'loss' in locals() else 0.0
                         current_acc = acc_val.item() if 'acc_val' in locals() else 0.0
                         print('| Global Round : {} | User: {} | Local Epoch : {} | [{}/{} ({:.0f}%)]\tLoss: {:.3f} | Acc: {:.3f}'.format(
-                                global_round, idx, iter, processed, total_samples,
+                                global_round, idx, epoch, processed, total_samples,
                                 100. * processed / total_samples if total_samples > 0 else 0,
                                 current_loss, current_acc))
                     
@@ -959,12 +975,14 @@ class LocalUpdate(object):
             global_low_protos: 全局 low-level prototypes
             global_logits: 全局 logits
             scl_weight: SCL 损失权重
-            is_synthetic: 是否为合成数据（如果是，跳过 loss_proto_low）
+            is_synthetic: 是否为合成数据
+                - 如果是合成数据，关闭所有与 encoder 相关的损失（loss_scl, loss_proto_high, loss_proto_low）
+                - 只保留 loss_ace 和 loss_soft （训练 classifier）
         
         Returns:
             (loss_ace, loss_scl, loss_proto_high, loss_proto_low, loss_soft)
         """
-        # Loss 1 (ABBL): L_ACE - 自适应交叉熵损失
+        # Loss 1 (ABBL): L_ACE - 自适应交叉熵损失（始终计算，用于训练 classifier）
         a_ce_gamma = getattr(args, 'a_ce_gamma', 0.1)
         loss_ace = self.logit_adjustment_ce(
             logits=logits,
@@ -974,12 +992,18 @@ class LocalUpdate(object):
         )
 
         # Loss 2 (ABBL): L_A-SCL - 自适应监督对比学习损失
-        loss_scl = self.compute_adaptive_supervised_contrastive_loss(
-            projected_features=projected_features,
-            labels=labels,
-            n_k=self.pi_sample_per_class,
-            args=args
-        )
+        # 合成特征不经过 encoder，projector 用于训练 encoder，所以应该关闭
+        if is_synthetic:
+            # 合成特征与 encoder 无关，关闭对比学习损失
+            loss_scl = 0 * loss_ace
+        else:
+            # 真实数据：计算对比学习损失，用于训练 encoder 学习更好的特征表示
+            loss_scl = self.compute_adaptive_supervised_contrastive_loss(
+                projected_features=projected_features,
+                labels=labels,
+                n_k=self.pi_sample_per_class,
+                args=args
+            )
 
         # Loss 3 & 4 (FedMPS): Multi-level prototype contrastive learning
         loss_mysupcon = MySupConLoss(temperature=0.5)
@@ -987,21 +1011,24 @@ class LocalUpdate(object):
             loss_proto_high = 0 * loss_ace
             loss_proto_low = 0 * loss_ace
         else:
-            # High-level prototype loss (始终计算)
-            global_h_input, global_h_labels = self.hcfit(global_high_protos, high_protos, labels)
-            local_h_input = F.normalize(high_protos, dim=1)
-            local_h_labels = labels
-            global_h_input = F.normalize(global_h_input, dim=1)
-            loss_proto_high = loss_mysupcon.forward(
-                feature_i=local_h_input, feature_j=global_h_input,
-                label_i=local_h_labels, label_j=global_h_labels
-            )
-            
-            # Low-level prototype loss (仅对真实数据计算)
             if is_synthetic:
-                # 修复 Low-level 缺失：对合成数据跳过 loss_proto_low
+                # 合成特征不经过 encoder，无法训练 encoder 对齐
+                # 合成特征只用于训练 classifier，不应该计算 prototype loss
+                loss_proto_high = 0 * loss_ace
                 loss_proto_low = 0 * loss_ace
             else:
+                # 真实数据：计算 high-level 和 low-level prototype loss
+                # High-level prototype loss：对齐本地 encoder 输出的特征与全局 high-level prototypes
+                global_h_input, global_h_labels = self.hcfit(global_high_protos, high_protos, labels)
+                local_h_input = F.normalize(high_protos, dim=1)
+                local_h_labels = labels
+                global_h_input = F.normalize(global_h_input, dim=1)
+                loss_proto_high = loss_mysupcon.forward(
+                    feature_i=local_h_input, feature_j=global_h_input,
+                    label_i=local_h_labels, label_j=global_h_labels
+                )
+                
+                # Low-level prototype loss：对齐本地 encoder 输出的 low-level 特征与全局 low-level prototypes
                 global_l_input, global_l_labels = self.hcfit(global_low_protos, low_protos, labels)
                 local_l_input = F.normalize(low_protos, dim=1)
                 local_l_labels = labels
@@ -1012,6 +1039,7 @@ class LocalUpdate(object):
                 )
 
         # Loss 5 (FedMPS): distillation loss
+        # 使用高级合成特征训练分类器时，默认关闭使用全局分类器的logits蒸馏
         soft_loss = nn.KLDivLoss(reduction="batchmean")
         T = args.T
         if len(global_logits) == 0:
@@ -1172,7 +1200,11 @@ class LocalUpdate(object):
             pi_sample_per_class: torch.Tensor, shape (num_classes,)
                 平滑处理后的类别分布，所有类别（包括缺失类别）都有非零的样本数。
         """
-        class_size_min = real_sample_per_class[real_sample_per_class > 0].min()
+        pos_samples = real_sample_per_class[real_sample_per_class > 0]
+        if pos_samples.numel() == 0:
+            # 如果没有任何样本，返回全1分布的平滑结果
+            return torch.ones_like(real_sample_per_class) * beta_pi
+        class_size_min = pos_samples.min()
         pi_sample_per_class = real_sample_per_class.clone()
         pi_sample_per_class[pi_sample_per_class == 0] = class_size_min * beta_pi
         return pi_sample_per_class

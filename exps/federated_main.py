@@ -471,16 +471,23 @@ def distribute_synthetic_features_to_clients(args, class_syn_datasets, user_grou
         client_classes = set(classes_list[client_id])  # 客户端拥有的类别
         
         # 统计该客户端每个类别的真实数据量
-        local_model = LocalUpdate(args=args, dataset=train_dataset, idxs=user_groups[client_id])
-        # 从 trainloader 统计每个类别的样本数
+        # 直接从数据集提取标签，避免耗尽 DataLoader 迭代器
         all_labels = []
-        for batch_data in local_model.trainloader:
-            if isinstance(batch_data, tuple) and len(batch_data) == 2:
-                _, labels = batch_data
-                all_labels.append(labels)
+        client_idxs = user_groups[client_id]
+        for idx in client_idxs:
+            try:
+                _, label = train_dataset[int(idx)]
+                # 统一转换为标量
+                if isinstance(label, torch.Tensor):
+                    label_val = label.item() if label.numel() == 1 else int(label)
+                else:
+                    label_val = int(label)
+                all_labels.append(label_val)
+            except Exception:
+                continue
         
         if len(all_labels) > 0:
-            all_labels_tensor = torch.cat(all_labels, dim=0)
+            all_labels_tensor = torch.tensor(all_labels, dtype=torch.long)
             real_samples_per_class = all_labels_tensor.bincount(minlength=num_classes)
         else:
             real_samples_per_class = torch.zeros(num_classes, dtype=torch.long)
